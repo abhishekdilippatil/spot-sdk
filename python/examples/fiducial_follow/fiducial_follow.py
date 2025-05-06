@@ -551,7 +551,7 @@ def main():
                         help='Distance [meters] that the robot should stop from the fiducial.')
     parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='If the robot should limit its maximum speed.')
-    parser.add_argument('--avoid-obstacles', default=False, type=lambda x:
+    parser.add_argument('--avoid-obstacles', default=True, type=lambda x:
                         (str(x).lower() == 'true'),
                         help='If the robot should have obstacle avoidance enabled.')
     parser.add_argument(
