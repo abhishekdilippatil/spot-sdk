@@ -102,7 +102,7 @@ def main():
                 blocking_stand(command_client, timeout_sec=10)
                 robot.logger.info('Doggo is standing')
                 #Execution of script for 5 seconds, before moving onto next command.
-                time.sleep(5)     
+                time.sleep(3)     
                 
                 image_client = robot.ensure_client(ImageClient.default_service_name)
                 sources = image_client.list_image_sources() # pylint: disable=unused-variable
