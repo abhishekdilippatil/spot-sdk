@@ -1,5 +1,4 @@
 # Copyright (c) 2023 Boston Dynamics, Inc.  All rights reserved.
-#
 # Downloading, reproducing, distributing or otherwise using the SDK Software
 # is subject to the terms and conditions of the Boston Dynamics Software
 # Development Kit License (20191101-BDSDK-SL).
@@ -17,7 +16,6 @@ from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.robot_command import RobotCommandClient, blocking_stand
 from bosdyn.client.image import ImageClient
-
 
 class EStop():
     """Manages a simple E-Stop configuration and keep-alive for the program."""
@@ -60,7 +58,6 @@ def main():
 
         # SDK object is created and is a primamry interface to the API.
         # This will initialize typical default parameters
-        # 
         sdk = bosdyn.client.create_standard_sdk('BasicProgram') 
 
         # Create robot object
