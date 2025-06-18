@@ -197,6 +197,13 @@ class WasdInterface(object):
 
     def drive(self, stdscr):
         """User interface to control the robot via the passed-in curses screen interface object."""
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)    # Green text
+        curses.init_pair(2, curses.COLOR_RED, -1)      # Red text
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Yellow text
+        curses.init_pair(4, curses.COLOR_CYAN, -1)     # Cyan text
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # Magenta (optional)
         with ExitCheck() as self._exit_check:
             curses_handler = CursesHandler(self)
             curses_handler.setLevel(logging.INFO)
@@ -231,16 +238,47 @@ class WasdInterface(object):
 
     def _drive_draw(self, stdscr, lease_keep_alive):
         """Draw the interface screen at each update."""
-        stdscr.clear()  # clear screen
+        stdscr.clear()
         stdscr.resize(26, 140)
+
         stdscr.addstr(0, 0, f'{self._robot_id.nickname:20s} {self._robot_id.serial_number}')
-        stdscr.addstr(1, 0, self._lease_str(lease_keep_alive))
+
+        # Lease Status
+        lease_str = self._lease_str(lease_keep_alive)
+        lease_color = curses.color_pair(1) if "RUNNING" in lease_str else curses.color_pair(3)
+        stdscr.addstr(1, 0, lease_str, lease_color | curses.A_BOLD)
+
+        # Battery
         stdscr.addstr(2, 0, self._battery_str())
-        stdscr.addstr(3, 0, self._estop_str())
-        stdscr.addstr(4, 0, self._power_state_str())
-        stdscr.addstr(5, 0, self._time_sync_str())
+
+        # Estop
+        estop_str = self._estop_str()
+        if "NOT ESTOP" in estop_str or "RUNNING" in estop_str or "RELEASED" in estop_str:
+            estop_color = curses.color_pair(1) | curses.A_BOLD  # GREEN, BOLD
+        elif "STOPPED" in estop_str or "ENGAGED" in estop_str or "ESTOPPED" in estop_str:
+            estop_color = curses.color_pair(2) | curses.A_BLINK | curses.A_BOLD  # RED, BLINK, BOLD
+        else:
+            estop_color = curses.color_pair(1) | curses.A_BOLD  # GREEN, BOLD
+        stdscr.addstr(3, 0, estop_str, estop_color)
+
+        # Power State
+        power_state = self._power_state()
+        if power_state == robot_state_proto.PowerState.STATE_ON:
+            power_color = curses.color_pair(1) | curses.A_BOLD  # GREEN, BOLD
+        elif power_state == robot_state_proto.PowerState.STATE_OFF:
+            power_color = curses.color_pair(2) | curses.A_BOLD  # RED, BOLD
+        else:
+            power_color = curses.color_pair(3) | curses.A_BOLD  # YELLOW, BOLD
+        stdscr.addstr(4, 0, self._power_state_str(), power_color)
+
+        # Time sync (cyan, not critical)
+        stdscr.addstr(5, 0, self._time_sync_str(), curses.color_pair(4))
+
+        # Messages
         for i in range(3):
             stdscr.addstr(7 + i, 2, self.message(i))
+
+        # Commands and UI instructions (plain or styled as you like)
         stdscr.addstr(10, 0, 'Commands: [TAB]: quit                               ')
         stdscr.addstr(11, 0, '          [SPACE]: Estop')
         stdscr.addstr(12, 0, '          [f]: Stand')
@@ -248,11 +286,9 @@ class WasdInterface(object):
         stdscr.addstr(14, 0, '          [p]: Power ON (manual)')
         stdscr.addstr(15, 0, '          [wasd]: Directional strafing              ')
         stdscr.addstr(16, 0, '          [qe]: Turning, [ESC]: Stop                ')
-        stdscr.addstr(17, 0, '')
-        stdscr.addstr(18, 0, '')
-        stdscr.addstr(19, 0, '')
 
         stdscr.refresh()
+
 
     def _drive_cmd(self, key):
         """Run user commands at each update."""
