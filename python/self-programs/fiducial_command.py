@@ -35,6 +35,8 @@ from bosdyn.client.robot_id import RobotIdClient, version_tuple
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.world_object import WorldObjectClient
 
+
+
 #pylint: disable=no-member
 LOGGER = logging.getLogger()
 
@@ -62,9 +64,9 @@ class FollowFiducial(object):
         self._tag_offset = float(options.distance_margin) + BODY_LENGTH / 2.0  # meters
 
         # Maximum speeds.
-        self._max_x_vel = 0.5
-        self._max_y_vel = 0.5
-        self._max_ang_vel = 1.0
+        self._max_x_vel = 0.2 #default is 0.5
+        self._max_y_vel = 0.2 #default is 0.5
+        self._max_ang_vel = 0.2 #default is 1
 
         # Indicator if fiducial detection's should be from the world object service using
         # spot's perception system or detected with the apriltag library. If the software version
@@ -237,6 +239,9 @@ class FollowFiducial(object):
                         z=vision_tform_fiducial_position[2]
                     )
                     detected_fiducial = True
+
+                    if detected_fiducial and fiducial_rt_world is not None:
+                        self.go_to_tag(fiducial_rt_world)
                 else:
                     print("No fiducials found")
                     detected_fiducial = False
@@ -307,7 +312,7 @@ class FollowFiducial(object):
             bboxes, tag_ids = self.detect_fiducial_in_image(image_response[0].shot.image, (width, height),
                                                    source_name)
             if bboxes:
-                print(f'Found bounding box for {source_name}')
+                #print(f'Found bounding box for {source_name}')
                 return bboxes, tag_ids, source_name
             else:
                 self._tag_not_located = True
@@ -323,17 +328,17 @@ class FollowFiducial(object):
         image_grey = self.rotate_image(image_grey, source_name)
 
         # Make the image greyscale to use bounding box detections
-        detector = apriltag(family='tag36h11')
+        detector = apriltag(families='tag36h11')
         detections = detector.detect(image_grey)
 
         bboxes = []
         tag_ids = []
         for det in detections:
-            bbox = det['lb-rb-rt-lt']
-        tag_id = det['id']  # Adjust this key if your apriltag lib uses a different key for ID
-        bboxes.append(bbox)
-        tag_ids.append(tag_id)
-        cv2.polylines(image_grey, [np.int32(bbox)], True, (0, 0, 0), 2)
+            bbox = det.corners
+            tag_id = det.tag_id# Adjust this key if your apriltag lib uses a different key for ID
+            bboxes.append(bbox)
+            tag_ids.append(tag_id)
+            cv2.polylines(image_grey, [np.int32(bbox)], True, (0, 0, 0), 2)
 
         self._image[source_name] = image_grey
         return bboxes, tag_ids
@@ -640,7 +645,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     bosdyn.client.util.add_base_arguments(parser)
-    parser.add_argument('--distance-margin', default=.15, #default value by boston dynamic was 0.5
+    parser.add_argument('--distance-margin', default=.5, #default value by boston dynamic was 0.5
                         help='Distance [meters] that the robot should stop from the fiducial.')
     parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='If the robot should limit its maximum speed.')
@@ -656,7 +661,8 @@ def main():
     if not options.use_world_objects:
         try:
             global apriltag
-            from apriltag import apriltag
+            from pupil_apriltags import Detector as apriltag
+
         except ImportError as e:
             print(f'Could not import the AprilTag library. Aborting. Exception: {e}')
             return False
