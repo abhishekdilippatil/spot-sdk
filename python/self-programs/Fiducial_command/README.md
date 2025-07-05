@@ -52,10 +52,14 @@ Note: this example can only be run on Windows and Linux; Mac OS is not supported
 To run the example:
 
 ```
-python3 -m fiducial_follow ROBOT_IP --use-world-objects false
+python3 fiducial_command.py ROBOT_IP --use-world-objects false --show-preview
 ```
 
 To stop the robot from moving, either remove the fiducial it is following from all camera's field of view or stop the code in the command line.
+
+### To run with preview 
+
+The command line argument `--show-preview` will toggle between preview turn on or off.
 
 ### Robot Movement
 

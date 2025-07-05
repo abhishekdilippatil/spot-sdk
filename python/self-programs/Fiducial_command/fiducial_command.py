@@ -655,6 +655,8 @@ def main():
     parser.add_argument(
         '--use-world-objects', default=True, type=lambda x: (str(x).lower() == 'true'),
         help='If fiducials should be from the world object service or the apriltag library.')
+    parser.add_argument('--show-preview', action='store_true', default=False,
+                    help='Show camera preview windows (default: False)')
     options = parser.parse_args()
 
     # If requested, attempt import of Apriltag library
@@ -685,7 +687,8 @@ def main():
 
             fiducial_follower = FollowFiducial(robot, options)
             time.sleep(.1)
-            if not options.use_world_objects and str.lower(sys.platform) != 'darwin':
+            if (not options.use_world_objects and str.lower(sys.platform) != 'darwin'
+                    and options.show_preview):
                 # Display the detected bounding boxes on the images when using the april tag library.
                 # This is disabled for MacOS-X operating systems.
                 image_viewer = DisplayImagesAsync(fiducial_follower)
