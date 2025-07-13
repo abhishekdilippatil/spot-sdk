@@ -46,6 +46,9 @@ This example is not supported on Windows OS if you want to use the external apri
 
 ## Running the Example
 
+
+python3 fiducial_command.py ROBOT_IP --use-world-objects false --show-preview
+
 ### E-Stop Endpoint Dependency
 
 The example depends on an external E-Stop endpoint application to configure E-Stop and cut off power to all motors in the robot, if necessary. In parallel with this example, please run the E-Stop SDK example as the E-Stop controller.

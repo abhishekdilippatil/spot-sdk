@@ -19,6 +19,7 @@ from PIL import Image
 
 import bosdyn.client
 import bosdyn.client.util
+import bosdyn.client.robot_command
 from bosdyn import geometry
 from bosdyn.api import geometry_pb2, image_pb2, trajectory_pb2, world_object_pb2
 from bosdyn.api.geometry_pb2 import SE2Velocity, SE2VelocityLimit, Vec2
@@ -164,7 +165,6 @@ class FollowFiducial(object):
         if self._standup:
             self.power_on()
             blocking_stand(self._robot_command_client)
-
             # Delay grabbing image until spot is standing (or close enough to upright).
             time.sleep(.35)
 
@@ -181,15 +181,18 @@ class FollowFiducial(object):
                     if vision_tform_fiducial is not None:
                         detected_fiducial = True
                         fiducial_rt_world = vision_tform_fiducial.position
+                        print(f"\n[INFO] Spot is walking to fiducial detected by world object service...\n")
+                        self.go_to_tag(fiducial_rt_world)
+                        print(f"\n[INFO] Spot reached fiducial. Resuming search for new tags...\n")
             else:
-                # Detect the april tag in the images from Spot using the apriltag library.
                 bboxes, tag_ids, source_name = self.image_to_bounding_box()
-                if bboxes:
+                if bboxes and tag_ids:
                     self._previous_source = source_name
-
-                    # Sort for comparison
                     current_tag_ids = sorted(tag_ids)
-                    if current_tag_ids != self._last_detected_tag_ids:
+                    # Prompt for tag selection if new set or if last selection not visible
+                    if (self._last_chosen_tag_id is None or 
+                        self._last_chosen_tag_id not in tag_ids or
+                        current_tag_ids != self._last_detected_tag_ids):
                         print("\nDetected AprilTags in view:")
                         for idx, tag_id in enumerate(tag_ids):
                             obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
@@ -197,8 +200,6 @@ class FollowFiducial(object):
                             _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
                             dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
                             print(f"  Tag {idx+1}: ID={tag_id}, Distance={dist_m:.2f} m")
-
-                        # Prompt user for a new tag to follow, only when IDs have changed
                         self._last_chosen_tag_id = None
                         while self._last_chosen_tag_id is None:
                             try:
@@ -211,48 +212,37 @@ class FollowFiducial(object):
                             except Exception:
                                 print("Invalid input. Please enter a valid tag ID.")
                         self._last_detected_tag_ids = current_tag_ids
-                    else:
-                        # Use previous selection if still present
-                        if self._last_chosen_tag_id not in tag_ids:
-                            print("\nPreviously selected tag is not visible. Please choose a new tag.")
-                            self._last_chosen_tag_id = None
-                            while self._last_chosen_tag_id is None:
-                                try:
-                                    user_input = input(f"\nEnter the ID of the tag you want Spot to follow (from {tag_ids}): ")
-                                    chosen_tag_id = int(user_input)
-                                    if chosen_tag_id not in tag_ids:
-                                        print(f"Tag ID {chosen_tag_id} is not detected. Try again.")
-                                    else:
-                                        self._last_chosen_tag_id = chosen_tag_id
-                                except Exception:
-                                    print("Invalid input. Please enter a valid tag ID.")
 
-                    # Use the chosen tag to navigate
-                    chosen_index = tag_ids.index(self._last_chosen_tag_id)
-                    obj_points, img_points = self.bbox_to_image_object_pts(bboxes[chosen_index])
-                    camera = self.make_camera_matrix(self._intrinsics)
-                    _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
-                    vision_tform_fiducial_position = self.compute_fiducial_in_world_frame(tvec)
-                    fiducial_rt_world = geometry_pb2.Vec3(
-                        x=vision_tform_fiducial_position[0],
-                        y=vision_tform_fiducial_position[1],
-                        z=vision_tform_fiducial_position[2]
-                    )
-                    detected_fiducial = True
-
-                    if detected_fiducial and fiducial_rt_world is not None:
+                    # At this point, a chosen tag is in view—go to it!
+                    if self._last_chosen_tag_id in tag_ids:
+                        chosen_index = tag_ids.index(self._last_chosen_tag_id)
+                        obj_points, img_points = self.bbox_to_image_object_pts(bboxes[chosen_index])
+                        camera = self.make_camera_matrix(self._intrinsics)
+                        _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+                        vision_tform_fiducial_position = self.compute_fiducial_in_world_frame(tvec)
+                        fiducial_rt_world = geometry_pb2.Vec3(
+                            x=vision_tform_fiducial_position[0],
+                            y=vision_tform_fiducial_position[1],
+                            z=vision_tform_fiducial_position[2]
+                        )
+                        print(f"\n[INFO] Spot is walking to fiducial tag ID {self._last_chosen_tag_id}...\n")
                         self.go_to_tag(fiducial_rt_world)
+                        print(f"\n[INFO] Spot reached tag ID {self._last_chosen_tag_id}. Resuming search for new tags...\n")
+                        # Clear state for next round, so new tags can be picked up
+                        self._last_chosen_tag_id = None
+                        self._last_detected_tag_ids = []
+                    else:
+                        print("[INFO] Selected tag not in view. Rotating 90 degrees to scan...")
+                        self.rotate_in_place(angle_rad=math.pi/2, angular_speed=0.5)
                 else:
-                    print("No fiducials found")
-                    detected_fiducial = False
-                    self._last_detected_tag_ids = []
-                    self._last_chosen_tag_id = None
-
-            self._attempts += 1  #increment attempts at finding a fiducial
+                    print("[INFO] No fiducials found. Rotating 90 degrees to scan...")
+                    self.rotate_in_place(angle_rad=math.pi/2, angular_speed=0.5)
+                self._attempts += 1
 
         # Power off at the conclusion of the example.
         if self._powered_on:
             self.power_off()
+
 
     def get_fiducial_objects(self):
         """Get all fiducials that Spot detects with its perception system."""
@@ -276,6 +266,38 @@ class FollowFiducial(object):
         """Power off the robot."""
         self._robot.power_off()
         print(f'Powered Off {not self._robot.is_powered_on()}')
+
+    def rotate_in_place(self, angle_rad=math.pi/2, angular_speed=1): #Default angular speed is 0.5 rad/s
+        print(f"[INFO] No fiducials found. Rotating {round(math.degrees(angle_rad))} degrees to scan...")
+        mobility_params = self.set_mobility_params()
+        spin_cmd = RobotCommandBuilder.synchro_velocity_command(
+            v_x=0.0,
+            v_y=0.0,
+            v_rot=angular_speed if angle_rad >= 0 else -angular_speed,
+            frame_name=BODY_FRAME_NAME,
+            params=mobility_params,
+            body_height=0.0,
+            locomotion_hint=spot_command_pb2.HINT_AUTO
+        )
+        if self._movement_on and self._powered_on:
+            duration = abs(angle_rad / angular_speed)
+            # 1. Send spin command with duration
+            self._robot_command_client.robot_command(
+                lease=None, command=spin_cmd, end_time_secs=time.time() + duration
+            )
+            time.sleep(duration)
+            # Short pause for network latency before stopping
+            time.sleep(1) #Default is 0.1
+            # 2. Send stop command IMMEDIATELY, WITHOUT end_time_secs (this is the key!)
+            stop_cmd = RobotCommandBuilder.stop_command()
+                # v_x=0.0, v_y=0.0, v_rot=0.0, frame_name=BODY_FRAME_NAME,
+                # params=mobility_params, body_height=0.0,
+                # locomotion_hint=spot_command_pb2.HINT_AUTO)
+            try:
+                self._robot_command_client.robot_command(lease=None, command=stop_cmd)
+            except bosdyn.client.robot_command.ExpiredError as e:
+                print("[WARN] Spot reports stop command expired. Usually safe to ignore:", e)
+
 
     def image_to_bounding_box(self):
         """Determine which camera source has a fiducial.
@@ -509,10 +531,10 @@ class FollowFiducial(object):
 
     def set_mobility_params(self):
         """Set robot mobility params to disable obstacle avoidance."""
-        obstacles = spot_command_pb2.ObstacleParams(disable_vision_body_obstacle_avoidance=True,
-                                                    disable_vision_foot_obstacle_avoidance=True,
-                                                    disable_vision_foot_constraint_avoidance=True,
-                                                    obstacle_avoidance_padding=.001)
+        obstacles = spot_command_pb2.ObstacleParams(disable_vision_body_obstacle_avoidance=True, #Default is true
+                                                    disable_vision_foot_obstacle_avoidance=True, #Default is true
+                                                    disable_vision_foot_constraint_avoidance=True, #Default is true
+                                                    obstacle_avoidance_padding=.001) #Default is .001
         body_control = self.set_default_body_control()
         if self._limit_speed:
             speed_limit = SE2VelocityLimit(max_vel=SE2Velocity(
@@ -645,7 +667,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     bosdyn.client.util.add_base_arguments(parser)
-    parser.add_argument('--distance-margin', default=.5, #default value by boston dynamic was 0.5
+    parser.add_argument('--distance-margin', default=.25, #default value by boston dynamic was 0.5
                         help='Distance [meters] that the robot should stop from the fiducial.')
     parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='If the robot should limit its maximum speed.')
