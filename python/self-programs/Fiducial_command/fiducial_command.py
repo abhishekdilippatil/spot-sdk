@@ -6,13 +6,14 @@
 
 # Copyright (c) 2023 Boston Dynamics, Inc.  All rights reserved.
 
-""" Detect and follow fiducial tags (AprilTag-only version). """
+""" Detect and follow AprilTag. """
 import logging
 import math
 import signal
 import sys
 import threading
 import time
+import os
 from sys import platform
 
 import cv2
@@ -41,12 +42,15 @@ from bosdyn.client.robot_state import RobotStateClient
 
 LOGGER = logging.getLogger()
 
+# Use this length to make sure we're commanding the head of the robot
+# to a position instead of the center.
 BODY_LENGTH = 1.1
 
 class FollowFiducial(object):
-    """ Detect and follow a fiducial with Spot (AprilTag only). """
+    """ Detect and follow a AprilTag. """
 
     def __init__(self, robot, options):
+        # Robot instance variable.
         self._last_detected_tag_ids = []
         self._last_chosen_tag_id = None
         self._robot = robot
@@ -56,63 +60,100 @@ class FollowFiducial(object):
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
+        # Stopping Distance (x,y) offset from the tag and angle offset from desired angle.
         self._tag_offset = float(options.distance_margin) + BODY_LENGTH / 2.0  # meters
 
+        # Maximum speeds.
         self._max_x_vel = 0.2
         self._max_y_vel = 0.2
         self._max_ang_vel = 0.2
 
-        self._standup = True
-        self._movement_on = True
-        self._limit_speed = options.limit_speed
-        self._avoid_obstacles = options.avoid_obstacles
+        # Indicators for movement and image displays.
+        self._standup = True # Stand up the robot.
+        self._movement_on = True # Let the robot walk towards the AprilTag.
+        self._limit_speed = options.limit_speed # Limit the robot's walking speed.
+        self._avoid_obstacles = options.avoid_obstacles # Disable obstacle avoidance.
 
+        # Epsilon distance between robot and desired go-to point.
         self._x_eps = .05
         self._y_eps = .05
-        self._angle_eps = .075
+        self._angle_eps = .005
 
+        # Indicator for if motor power is on.
         self._powered_on = False
+
+        # Counter for the number of iterations completed.
         self._attempts = 0
+
+        # Maximum amount of iterations before powering off the motors.
         self._max_attempts = 100000
 
+        # Camera intrinsics for the current camera source being analyzed.
         self._intrinsics = None
+
+        # Transform from the robot's camera frame to the baselink frame.
+        # It is a math_helpers.SE3Pose.
         self._camera_tform_body = None
+
+        # Transform from the robot's baselink to the world frame.
+        # It is a math_helpers.SE3Pose.
         self._body_tform_world = None
+
+        # Latest detected AprilTag's position in the world.
         self._current_tag_world_pose = np.array([])
+
+        # Heading angle based on the camera source which detected the AprilTag.
         self._angle_desired = None
+
+        # Dictionary mapping camera source to it's latest image taken.
         self._image = dict()
+
+        # List of all possible camera sources.
         self._source_names = [
             src.name for src in self._image_client.list_image_sources()
             if (src.image_type == image_pb2.ImageSource.IMAGE_TYPE_VISUAL and 'depth' not in src.name)
         ]
         print(self._source_names)
+
+        # Dictionary mapping camera source to previously computed extrinsics.
         self._camera_to_extrinsics_guess = self.populate_source_dict()
+
+        # Camera source which a bounding box was last detected in.
         self._previous_source = None
 
     @property
     def robot_state(self):
+        """Get latest robot state proto."""
         return self._robot_state_client.get_robot_state()
 
     @property
     def image(self):
+        """Return the current image associated with each source name."""
         return self._image
 
     @property
     def image_sources_list(self):
+        """Return the list of camera sources."""
         return self._source_names
 
     def populate_source_dict(self):
+        """Fills dictionary of the most recently computed camera extrinsics with the camera source.
+           The initial boolean indicates if the extrinsics guess should be used."""
         camera_to_extrinsics_guess = dict()
         for src in self._source_names:
+            # Dictionary values: use_extrinsics_guess bool, (rotation vector, translation vector) tuple.
             camera_to_extrinsics_guess[src] = (False, (None, None))
         return camera_to_extrinsics_guess
 
     def start(self):
-        """Claim lease of robot and start the fiducial follower (AprilTags only)."""
+        """Claim lease of robot and start the AprilTag follower."""
         self._robot.time_sync.wait_for_sync()
+        # Stand the robot up.
         if self._standup:
             self.power_on()
             blocking_stand(self._robot_command_client)
+
+            # Delay grabbing image until spot is standing (or close enough to upright).
             time.sleep(.35)
 
         while self._attempts <= self._max_attempts:
@@ -155,9 +196,9 @@ class FollowFiducial(object):
                         y=vision_tform_fiducial_position[1],
                         z=vision_tform_fiducial_position[2]
                     )
-                    print(f"\nSpot is walking to fiducial tag ID {self._last_chosen_tag_id}...\n")
+                    print(f"\n Spot is walking to AprilTag ID {self._last_chosen_tag_id}...\n")
                     self.go_to_tag(fiducial_rt_world)
-                    print(f"\nSpot reached tag ID {self._last_chosen_tag_id}.")
+                    print(f"\n Spot reached tag ID {self._last_chosen_tag_id}.")
                     next_action = self.prompt_next_action()
                     if next_action == "q":
                         print("Quitting as requested by user.")
@@ -176,38 +217,47 @@ class FollowFiducial(object):
                         self._last_chosen_tag_id = None
                         self._last_detected_tag_ids = []
             else:
-                print("[INFO] No fiducials found. Rotating 90 degrees to scan...")
+                print("No AprilTags found. Rotating 90 degrees to scan...")
                 self.rotate_in_place(angle_rad=math.pi/2, angular_speed=0.5)
-                self._attempts += 1
+                self._attempts += 1 #increment attempts at finding an AprilTag
 
+        # Power off at the conclusion of the example.
         if self._powered_on:
             self.power_off()
 
     def power_on(self):
+        """Power on the robot."""
         self._robot.power_on()
         self._powered_on = True
         print(f'Powered On {self._robot.is_powered_on()}')
 
     def power_off(self):
+        """Power off the robot."""
         self._robot.power_off()
         print(f'Powered Off {not self._robot.is_powered_on()}')
 
     def prompt_next_action(self):
-        print("\n[USER] Spot has reached the tag.")
+        """Prompt the user for the next action."""
+        print("\nSpot has reached the tag.")
         print("What should Spot do next?")
+        print("  [p] Take photo from all cameras and save")
         print("  [n] Find another tag and follow")
-        print("  [q] Quit")
         print("  [r] Rotate 90 degrees and search")
         print("  [s] Stay here")
+        print("  [q] Quit")
         while True:
-            action = input("Enter your choice [n/q/r/s]: ").strip().lower()
-            if action in ["n", "q", "r", "s"]:
+            action = input("Enter your choice [n/q/r/s/p]: ").strip().lower()
+            if action in ["n", "q", "r", "s", "p"]:
+                if action == "p":
+                    self.capture_and_save_photos_from_all_cameras()
+                    continue #Show menu after taking photo
                 return action
             else:
-                print("Invalid input. Please enter one of: n, q, r, s.")
+                print("Invalid input. Please enter one of: n, q, r, s, p.")
 
-    def rotate_in_place(self, angle_rad=math.pi/2, angular_speed=1):
-        print(f"[INFO] Rotating {round(math.degrees(angle_rad))} degrees to scan...")
+    def rotate_in_place(self, angle_rad=math.pi/2, angular_speed=1): # angle_rad in radians, angle can be changed by changing pi/2
+        """Rotate in place."""
+        print(f" Rotating {round(math.degrees(angle_rad))} degrees to scan...")
         mobility_params = self.set_mobility_params()
         spin_cmd = RobotCommandBuilder.synchro_velocity_command(
             v_x=0.0,
@@ -229,12 +279,55 @@ class FollowFiducial(object):
             try:
                 self._robot_command_client.robot_command(lease=None, command=stop_cmd)
             except bosdyn.client.robot_command.ExpiredError as e:
-                print("[WARN] Spot reports stop command expired. Usually safe to ignore:", e)
+                print(" Spot reports stop command expired. (Usually safe to ignore)", e)
+    
+    def capture_and_save_photos_from_all_cameras(self):
+        """
+        Prompts the user to capture a photo from all cameras and asks where to save.
+        """
+        print("\n Capture photos from all cameras")
+        input("Press Enter to take photos from all cameras...")
+
+        images = {}
+        for source_name in self._source_names:
+            print(f" Capturing image from {source_name}...")
+            img_req = build_image_request(source_name, quality_percent=100,
+                                        image_format=image_pb2.Image.FORMAT_RAW)
+            image_response = self._image_client.get_image([img_req])
+            width = image_response[0].shot.image.cols
+            height = image_response[0].shot.image.rows
+
+            # Convert raw bytes to 8-bit greyscale numpy array
+            image_grey = np.array(
+                Image.frombytes('P', (int(width), int(height)),
+                                data=image_response[0].shot.image.data, decoder_name='raw'))
+
+            image_grey = self.rotate_image(image_grey, source_name)
+            images[source_name] = image_grey
+
+        # Ask user for directory
+        save_dir = input("\nEnter the directory path to save images (will be created if it doesn't exist): ").strip()
+        if not save_dir:
+            save_dir = os.getcwd()
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # Save all images
+        for source_name, image in images.items():
+            out_path = os.path.join(save_dir, f"{source_name}.png")
+            cv2.imwrite(out_path, image)
+            print(f" Saved {source_name} to {out_path}")
+        print(" All images saved!\n")
 
     def image_to_bounding_box(self):
+        """Determine which camera source has a AprilTag..
+           Return the bounding box of the first detected AprilTag."""
+        #Iterate through all five camera sources to check for a AprilTag.
         for i in range(len(self._source_names) + 1):
+            # Get the image from the source camera.
             if i == 0:
                 if self._previous_source is not None:
+                    # Prioritize the camera the AprilTag was last detected in.
                     source_name = self._previous_source
                 else:
                     continue
@@ -251,10 +344,13 @@ class FollowFiducial(object):
                                                     BODY_FRAME_NAME)
             self._body_tform_world = get_a_tform_b(image_response[0].shot.transforms_snapshot,
                                                    BODY_FRAME_NAME, VISION_FRAME_NAME)
+            
+            # Camera intrinsics for the given source camera.
             self._intrinsics = image_response[0].source.pinhole.intrinsics
             width = image_response[0].shot.image.cols
             height = image_response[0].shot.image.rows
 
+            # detect given AprilTag in image and return the bounding box of it
             bboxes, tag_ids = self.detect_fiducial_in_image(image_response[0].shot.image, (width, height),
                                                    source_name)
             if bboxes:
@@ -265,15 +361,21 @@ class FollowFiducial(object):
         return [],[], None
 
     def detect_fiducial_in_image(self, image, dim, source_name):
+        """Detect the AprilTag within a single image and return its bounding box."""
         image_grey = np.array(
         Image.frombytes('P', (int(dim[0]), int(dim[1])), data=image.data, decoder_name='raw'))
+
+        #Rotate each image such that it is upright
         image_grey = self.rotate_image(image_grey, source_name)
+
+        #Make the image greyscale to use bounding box detections
         detector = apriltag(families='tag36h11')
         detections = detector.detect(image_grey)
 
         bboxes = []
         tag_ids = []
         for det in detections:
+            # Draw the bounding box detection in the image.
             bbox = det.corners
             tag_id = det.tag_id
             bboxes.append(bbox)
@@ -283,16 +385,23 @@ class FollowFiducial(object):
         return bboxes, tag_ids
 
     def bbox_to_image_object_pts(self, bbox):
+        """Determine the object points and image points for the bounding box.
+           The origin in object coordinates = top left corner of the AprilTag.
+           Order both points sets following: (TL,TR, BL, BR)"""
         fiducial_height_and_width = 146  # mm
         obj_pts = np.array([[0, 0], [fiducial_height_and_width, 0], [0, fiducial_height_and_width],
                             [fiducial_height_and_width, fiducial_height_and_width]],
                            dtype=np.float32)
+        #insert a 0 as the third coordinate (xyz)
         obj_points = np.insert(obj_pts, 2, 0, axis=1)
+
+        #['lb-rb-rt-lt']
         img_pts = np.array([[bbox[3][0], bbox[3][1]], [bbox[2][0], bbox[2][1]],
                             [bbox[0][0], bbox[0][1]], [bbox[1][0], bbox[1][1]]], dtype=np.float32)
         return obj_points, img_pts
 
     def compute_fiducial_in_world_frame(self, tvec):
+        """Transform the tag position from camera coordinates to world coordinates."""
         fiducial_rt_camera_frame = np.array(
             [float(tvec[0][0]) / 1000.0,
              float(tvec[1][0]) / 1000.0,
@@ -304,17 +413,23 @@ class FollowFiducial(object):
         return fiducial_rt_world
 
     def go_to_tag(self, fiducial_rt_world):
+        """Use the position of the april tag in vision world frame and command the robot."""
+        # Compute the go-to point (offset by .5m from the AprilTag position) and the heading at
+        # this point.
         self._current_tag_world_pose, self._angle_desired = self.offset_tag_pose(
             fiducial_rt_world, self._tag_offset)
+        #Command the robot to go to the tag in kinematic odometry frame
         mobility_params = self.set_mobility_params()
         tag_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
             goal_x=self._current_tag_world_pose[0], goal_y=self._current_tag_world_pose[1],
             goal_heading=self._angle_desired, frame_name=VISION_FRAME_NAME, params=mobility_params,
             body_height=0.0, locomotion_hint=spot_command_pb2.HINT_AUTO)
-        end_time = 5.0
+        end_time = 30.0
         if self._movement_on and self._powered_on:
+            #Issue the command to the robot
             self._robot_command_client.robot_command(lease=None, command=tag_cmd,
                                                      end_time_secs=time.time() + end_time)
+            #Feedback to check and wait until the robot is in the desired position or timeout
             start_time = time.time()
             current_time = time.time()
             while (not self.final_state() and current_time - start_time < end_time):
@@ -323,6 +438,7 @@ class FollowFiducial(object):
         return
 
     def final_state(self):
+        """Check if the current robot state is within range of the AprilTags position."""
         robot_state = get_vision_tform_body(self.robot_state.kinematic_state.transforms_snapshot)
         robot_angle = robot_state.rot.to_yaw()
         if self._current_tag_world_pose.size != 0:
@@ -334,12 +450,14 @@ class FollowFiducial(object):
         return False
 
     def get_desired_angle(self, xhat):
+        """Compute heading based on the vector from robot to object."""
         zhat = [0.0, 0.0, 1.0]
         yhat = np.cross(zhat, xhat)
         mat = np.array([xhat, yhat, zhat]).transpose()
         return Quat.from_matrix(mat).to_yaw()
 
     def offset_tag_pose(self, object_rt_world, dist_margin=1.0):
+        """Offset the go-to location of the AprilTag and compute the desired heading."""
         robot_rt_world = get_vision_tform_body(self.robot_state.kinematic_state.transforms_snapshot)
         robot_to_object_ewrt_world = np.array(
             [object_rt_world.x - robot_rt_world.x, object_rt_world.y - robot_rt_world.y, 0])
@@ -353,6 +471,7 @@ class FollowFiducial(object):
         return goto_rt_world, heading
 
     def set_mobility_params(self):
+        """Set robot mobility params to disable obstacle avoidance."""
         obstacles = spot_command_pb2.ObstacleParams(disable_vision_body_obstacle_avoidance=True,
                                                     disable_vision_foot_obstacle_avoidance=True,
                                                     disable_vision_foot_constraint_avoidance=True,
@@ -374,11 +493,13 @@ class FollowFiducial(object):
                 obstacle_params=obstacles, body_control=body_control,
                 locomotion_hint=spot_command_pb2.HINT_AUTO)
         else:
+            #When set to none, RobotCommandBuilder populates with good default values
             mobility_params = None
         return mobility_params
 
     @staticmethod
     def set_default_body_control():
+        """Set default body control params to current body position"""
         footprint_R_body = geometry.EulerZXY()
         position = geometry_pb2.Vec3(x=0.0, y=0.0, z=0.0)
         rotation = footprint_R_body.to_quaternion()
@@ -389,6 +510,7 @@ class FollowFiducial(object):
 
     @staticmethod
     def rotate_image(image, source_name):
+        """Rotate the image so that it is always displayed upright."""
         if source_name == 'frontleft_fisheye_image':
             image = cv2.rotate(image, rotateCode=0)
         elif source_name == 'right_fisheye_image':
@@ -399,6 +521,7 @@ class FollowFiducial(object):
 
     @staticmethod
     def make_camera_matrix(ints):
+        """Transform the ImageResponse proto intrinsics into a camera matrix."""
         camera_matrix = np.array([[ints.focal_length.x, ints.skew.x, ints.principal_point.x],
                                   [ints.skew.y, ints.focal_length.y, ints.principal_point.y],
                                   [0, 0, 1]])
@@ -406,6 +529,7 @@ class FollowFiducial(object):
 
 
 class DisplayImagesAsync(object):
+    """Display the images Spot sees from all five cameras."""
     def __init__(self, fiducial_follower):
         self._fiducial_follower = fiducial_follower
         self._thread = None
@@ -413,6 +537,7 @@ class DisplayImagesAsync(object):
         self._sources = []
 
     def get_image(self):
+        """Retrieve current images (with bounding boxes) from the AprilTag detector."""
         images = self._fiducial_follower.image
         image_by_source = []
         for s_name in self._sources:
@@ -423,6 +548,7 @@ class DisplayImagesAsync(object):
         return image_by_source
 
     def start(self):
+        """Initialize the thread to display the images."""
         if self._started:
             return None
         self._sources = self._fiducial_follower.image_sources_list
@@ -432,6 +558,7 @@ class DisplayImagesAsync(object):
         return self
 
     def update(self):
+        """Update the images being displayed to match that seen by the robot."""
         while self._started:
             images = self.get_image()
             for i, image in enumerate(images):
@@ -447,11 +574,13 @@ class DisplayImagesAsync(object):
                     cv2.waitKey(1)
 
     def stop(self):
+        """Stop the thread and the image displays."""
         self._started = False
         cv2.destroyAllWindows()
 
 
 class Exit(object):
+    """Handle exiting on SIGTERM."""
     def __init__(self):
         self._kill_now = False
         signal.signal(signal.SIGTERM, self._sigterm_handler)
@@ -467,16 +596,18 @@ class Exit(object):
 
     @property
     def kill_now(self):
+        """Return if sigterm received and program should end."""
         return self._kill_now
 
 
 def main():
+    """Command-line interface."""
     import argparse
 
     parser = argparse.ArgumentParser()
     bosdyn.client.util.add_base_arguments(parser)
-    parser.add_argument('--distance-margin', default=.25,
-                        help='Distance [meters] that the robot should stop from the fiducial.')
+    parser.add_argument('--distance-margin', default=.25, ##default value by boston dynamic was 0.5
+                        help='Distance [meters] that the robot should stop from the AprilTag.')
     parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='If the robot should limit its maximum speed.')
     parser.add_argument('--avoid-obstacles', default=True, type=lambda x:
@@ -501,6 +632,7 @@ def main():
             fiducial_follower = FollowFiducial(robot, options)
             time.sleep(.1)
             if str.lower(sys.platform) != 'darwin' and options.show_preview:
+                # Display the detected bounding boxes on the images when using the april tag library.
                 image_viewer = DisplayImagesAsync(fiducial_follower)
                 image_viewer.start()
             lease_client = robot.ensure_client(LeaseClient.default_service_name)

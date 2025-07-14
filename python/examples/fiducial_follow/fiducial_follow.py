@@ -4,7 +4,7 @@
 # is subject to the terms and conditions of the Boston Dynamics Software
 # Development Kit License (20191101-BDSDK-SL).
 
-""" Detect and follow fiducial tags. """
+""" Detect and follow fiducial. """
 import logging
 import math
 import signal
@@ -65,7 +65,7 @@ class FollowFiducial(object):
         self._max_ang_vel = 1.0
 
         # Indicator if fiducial detection's should be from the world object service using
-        # spot's perception system or detected with the apriltag library. If the software version
+        # spot's perception system or detected with the fiducial library. If the software version
         # does not include the world object service, then default to april tag library.
         self._use_world_object_service = (options.use_world_objects and
                                           self.check_if_version_has_world_objects(self._robot_id))
@@ -173,12 +173,12 @@ class FollowFiducial(object):
                 if fiducial is not None:
                     vision_tform_fiducial = get_a_tform_b(
                         fiducial.transforms_snapshot, VISION_FRAME_NAME,
-                        fiducial.apriltag_properties.frame_name_fiducial).to_proto()
+                        fiducial.fiducial_properties.frame_name_fiducial).to_proto()
                     if vision_tform_fiducial is not None:
                         detected_fiducial = True
                         fiducial_rt_world = vision_tform_fiducial.position
             else:
-                # Detect the april tag in the images from Spot using the apriltag library.
+                # Detect the april tag in the images from Spot using the fiducial library.
                 bboxes, source_name = self.image_to_bounding_box()
                 if bboxes:
                     self._previous_source = source_name
@@ -194,7 +194,7 @@ class FollowFiducial(object):
                 # Go to the tag and stop within a certain distance
                 self.go_to_tag(fiducial_rt_world)
             else:
-                print('No fiducials found')
+                print('No fiducial found')
 
             self._attempts += 1  #increment attempts at finding a fiducial
 
@@ -205,7 +205,7 @@ class FollowFiducial(object):
     def get_fiducial_objects(self):
         """Get all fiducials that Spot detects with its perception system."""
         # Get all fiducial objects (an object of a specific type).
-        request_fiducials = [world_object_pb2.WORLD_OBJECT_APRILTAG]
+        request_fiducials = [world_object_pb2.WORLD_OBJECT_fiducial]
         fiducial_objects = self._world_object_client.list_world_objects(
             object_type=request_fiducials).world_objects
         if len(fiducial_objects) > 0:
@@ -276,7 +276,7 @@ class FollowFiducial(object):
         image_grey = self.rotate_image(image_grey, source_name)
 
         #Make the image greyscale to use bounding box detections
-        detector = apriltag(family='tag36h11')
+        detector = fiducial(family='tag36h11')
         detections = detector.detect(image_grey)
 
         bboxes = []
@@ -556,16 +556,16 @@ def main():
                         help='If the robot should have obstacle avoidance enabled.')
     parser.add_argument(
         '--use-world-objects', default=True, type=lambda x: (str(x).lower() == 'true'),
-        help='If fiducials should be from the world object service or the apriltag library.')
+        help='If fiducials should be from the world object service or the fiducial library.')
     options = parser.parse_args()
 
-    # If requested, attempt import of Apriltag library
+    # If requested, attempt import of fiducial library
     if not options.use_world_objects:
         try:
-            global apriltag
-            from apriltag import apriltag
+            global fiducial
+            from fiducial import fiducial
         except ImportError as e:
-            print(f'Could not import the AprilTag library. Aborting. Exception: {e}')
+            print(f'Could not import the fiducial library. Aborting. Exception: {e}')
             return False
 
     # Create robot object.
