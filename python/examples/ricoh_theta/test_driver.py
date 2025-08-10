@@ -18,7 +18,7 @@ python3 test_driver.py
 from ricoh_theta import Theta
 
 # UPDATE ME!! This should be the SSID for the Ricoh Theta that is attempting to be queried.
-SSID = 'THETAYN14103427'
+SSID = 'THETAYN30103903'
 
 # set client_mode=True to use client mode network settings
 camera = Theta(theta_ssid=SSID, client_mode=False, show_state_at_init=False)
