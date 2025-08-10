@@ -39,6 +39,7 @@ from bosdyn.client.power import PowerClient
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
 from bosdyn.client.robot_id import RobotIdClient
 from bosdyn.client.robot_state import RobotStateClient
+from bosdyn.geometry import EulerZXY
 
 LOGGER = logging.getLogger()
 
@@ -205,9 +206,7 @@ class FollowFiducial(object):
                         break
                     elif next_action == "r":
                         print("Rotating 90 degrees as requested by user.")
-                        self.rotate_in_place(angle_rad=math.pi/2, angular_speed=0.5)
-                        self._last_chosen_tag_id = None
-                        self._last_detected_tag_ids = []
+                        self.sweep_yaw()
                     elif next_action == "s":
                         print("Staying here.")
                         self._last_chosen_tag_id = None
@@ -217,8 +216,8 @@ class FollowFiducial(object):
                         self._last_chosen_tag_id = None
                         self._last_detected_tag_ids = []
             else:
-                print("No AprilTags found. Rotating 90 degrees to scan...")
-                self.rotate_in_place(angle_rad=math.pi/2, angular_speed=0.5)
+                print("No AprilTags found. Rotating to scan...")
+                self.sweep_yaw()
                 self._attempts += 1 #increment attempts at finding an AprilTag
 
         # Power off at the conclusion of the example.
@@ -280,6 +279,18 @@ class FollowFiducial(object):
                 self._robot_command_client.robot_command(lease=None, command=stop_cmd)
             except bosdyn.client.robot_command.ExpiredError as e:
                 print(" Spot reports stop command expired. (Usually safe to ignore)", e)
+
+    def sweep_yaw(self, yaw_range=math.radians(90), steps=9, pause=1.0):
+        """Sweep Spot's body yaw left and right to look for AprilTags."""
+        max_yaw = yaw_range / 2
+        yaws = np.linspace(-max_yaw, max_yaw, steps)
+        for yaw in yaws:
+            orientation = EulerZXY(yaw, 0.0, 0.0)
+            stand_cmd = RobotCommandBuilder.synchro_stand_command(body_height=0.0, footprint_R_body=orientation)
+            self._robot_command_client.robot_command(lease=None, command=stand_cmd, end_time_secs=time.time() + pause)
+            time.sleep(pause)
+            self._last_chosen_tag_id = None
+            self._last_detected_tag_ids = []
     
     def capture_and_save_photos_from_all_cameras(self):
         """
