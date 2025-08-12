@@ -40,18 +40,42 @@ from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient,
 from bosdyn.client.robot_id import RobotIdClient
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.geometry import EulerZXY
+import select
+try:
+    import msvcrt
+    _WIN = True
+except Exception:
+    import tty, termios
+    _WIN = False
+
 
 LOGGER = logging.getLogger()
+#for wasd
+VELOCITY_BASE_SPEED   = 0.5   # m/s
+VELOCITY_BASE_ANGULAR = 0.8   # rad/s
+VELOCITY_CMD_DURATION = 0.6   # seconds
+
 
 # Use this length to make sure we're commanding the head of the robot
 # to a position instead of the center.
 BODY_LENGTH = 1.1
+
+ROT_MAP = {
+    'back_fisheye_image':  cv2.ROTATE_90_CLOCKWISE,
+    'frontleft_fisheye_image': cv2.ROTATE_180,
+    'frontright_fisheye_image': cv2.ROTATE_180,
+    'left_fisheye_image':  cv2.ROTATE_90_COUNTERCLOCKWISE,
+    'right_fisheye_image': cv2.ROTATE_90_CLOCKWISE,
+}
 
 class FollowFiducial(object):
     """ Detect and follow a AprilTag. """
 
     def __init__(self, robot, options):
         # Robot instance variable.
+        self.mode = 'manual'           
+        #for manual control
+        self._pending_detections = None
         self._last_detected_tag_ids = []
         self._last_chosen_tag_id = None
         self._robot = robot
@@ -87,7 +111,7 @@ class FollowFiducial(object):
         self._attempts = 0
 
         # Maximum amount of iterations before powering off the motors.
-        self._max_attempts = 100000
+        self._max_attempts = 5
 
         # Camera intrinsics for the current camera source being analyzed.
         self._intrinsics = None
@@ -161,64 +185,103 @@ class FollowFiducial(object):
             bboxes, tag_ids, source_name = self.image_to_bounding_box()
             if bboxes and tag_ids:
                 self._previous_source = source_name
-                current_tag_ids = sorted(tag_ids)
-                # Prompt for tag selection if new set or if last selection not visible
-                if (self._last_chosen_tag_id is None or 
-                    self._last_chosen_tag_id not in tag_ids or
-                    current_tag_ids != self._last_detected_tag_ids):
-                    print("\nDetected AprilTags in view:")
-                    for idx, tag_id in enumerate(tag_ids):
-                        obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
-                        camera = self.make_camera_matrix(self._intrinsics)
-                        _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
-                        dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
-                        print(f"  Tag {idx+1}: ID={tag_id}, Distance={dist_m:.2f} m")
-                    self._last_chosen_tag_id = None
-                    while self._last_chosen_tag_id is None:
-                        try:
-                            user_input = input(f"\nEnter the ID of the tag you want Spot to follow (from {tag_ids}): ")
-                            chosen_tag_id = int(user_input)
-                            if chosen_tag_id not in tag_ids:
-                                print(f"Tag ID {chosen_tag_id} is not detected. Try again.")
-                            else:
-                                self._last_chosen_tag_id = chosen_tag_id
-                        except Exception:
-                            print("Invalid input. Please enter a valid tag ID.")
-                    self._last_detected_tag_ids = current_tag_ids
-
-                if self._last_chosen_tag_id in tag_ids:
-                    chosen_index = tag_ids.index(self._last_chosen_tag_id)
-                    obj_points, img_points = self.bbox_to_image_object_pts(bboxes[chosen_index])
-                    camera = self.make_camera_matrix(self._intrinsics)
-                    _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
-                    vision_tform_fiducial_position = self.compute_fiducial_in_world_frame(tvec)
-                    fiducial_rt_world = geometry_pb2.Vec3(
-                        x=vision_tform_fiducial_position[0],
-                        y=vision_tform_fiducial_position[1],
-                        z=vision_tform_fiducial_position[2]
-                    )
-                    print(f"\n Spot is walking to AprilTag ID {self._last_chosen_tag_id}...\n")
-                    self.go_to_tag(fiducial_rt_world)
-                    print(f"\n Spot reached tag ID {self._last_chosen_tag_id}.")
-                    next_action = self.prompt_next_action()
-                    if next_action == "q":
-                        print("Quitting as requested by user.")
-                        break
-                    elif next_action == "r":
-                        print("Rotating 90 degrees as requested by user.")
-                        self.sweep_yaw()
-                    elif next_action == "s":
-                        print("Staying here.")
-                        self._last_chosen_tag_id = None
-                        self._last_detected_tag_ids = []
-                    elif next_action == "n":
-                        print("Searching for new tags.")
-                        self._last_chosen_tag_id = None
-                        self._last_detected_tag_ids = []
+                self.on_tags_detected(bboxes, tag_ids, source_name)
             else:
-                print("No AprilTags found. Rotating to scan...")
-                self.sweep_yaw()
-                self._attempts += 1 #increment attempts at finding an AprilTag
+                # Only auto-scan if we're not in manual driving (e.g., after user asked to search)
+                if self.mode != 'manual':
+                    print("No AprilTags found. Rotating to scan...")
+                    self.sweep_yaw()
+                    self._attempts += 1
+
+            # Optional: a tiny sleep so the keyboard thread gets CPU time.
+            time.sleep(0.02)
+
+
+            #     current_tag_ids = sorted(tag_ids)
+            #     # Prompt for tag selection if new set or if last selection not visible
+            #     if (self._last_chosen_tag_id is None or 
+            #         self._last_chosen_tag_id not in tag_ids or
+            #         current_tag_ids != self._last_detected_tag_ids):
+
+            #         # Show distances (optional helper)
+            #         self.print_detected_tags_with_distance(bboxes, tag_ids)
+            #         # print("\nDetected AprilTags in view:")
+            #         # for idx, tag_id in enumerate(tag_ids):
+            #         #     obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
+            #         #     camera = self.make_camera_matrix(self._intrinsics)
+            #         #     _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+            #         #     dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
+            #         #     print(f"  Tag {idx+1}: ID={tag_id}, Distance={dist_m:.2f} m")
+                    
+            #         # Ask ONLY the two questions here
+            #         action, chosen_tag_id = self.prompt_follow_or_rotate(tag_ids)
+            #         if action == "rotate":
+            #             print("Rotating 90 degrees as requested.")
+            #             self._previous_source = None
+            #             self.sweep_yaw()
+            #             self._last_chosen_tag_id = None
+            #             self._last_detected_tag_ids = []
+            #             continue  # go back to scanning loop
+
+            #         # action == "follow"
+            #         self._last_chosen_tag_id = chosen_tag_id
+            #         self._last_detected_tag_ids = current_tag_ids
+
+            #     if self._last_chosen_tag_id in tag_ids:
+            #         chosen_index = tag_ids.index(self._last_chosen_tag_id)
+            #         obj_points, img_points = self.bbox_to_image_object_pts(bboxes[chosen_index])
+            #         camera = self.make_camera_matrix(self._intrinsics)
+            #         _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+            #         vision_tform_fiducial_position = self.compute_fiducial_in_world_frame(tvec)
+            #         fiducial_rt_world = geometry_pb2.Vec3(
+            #             x=vision_tform_fiducial_position[0],
+            #             y=vision_tform_fiducial_position[1],
+            #             z=vision_tform_fiducial_position[2]
+            #         )
+            #         print(f"\n Spot is walking to AprilTag ID {self._last_chosen_tag_id}...\n")
+            #         self.go_to_tag(fiducial_rt_world)
+            #         print(f"\n Spot reached tag ID {self._last_chosen_tag_id}.")
+            #         next_action = self.prompt_next_action()
+            #         if next_action == "q":
+            #             print("Quitting as requested by user.")
+            #             break
+            #         elif next_action == "r":
+            #             print("Rotating 90 degrees as requested by user.")
+            #             self._previous_source = None
+            #             self.sweep_yaw()
+            #         elif next_action == "s":
+            #             print("Staying here.")
+            #             self._last_chosen_tag_id = None
+            #             self._last_detected_tag_ids = []
+            #         elif next_action == "n":
+            #             print("Searching for new tags.")
+            #             self._previous_source = None
+            #             self._last_chosen_tag_id = None
+            #             self._last_detected_tag_ids = []
+            # else:
+            #     print("No AprilTags found. Rotating to scan...")
+            #     # Escalate the yaw sweep each time, then stop after 5 tries
+            #     self._previous_source = None
+            #     self._attempts += 1  # increment attempts at finding an AprilTag
+
+            # if self._attempts > self._max_attempts:
+            #         print(f"No AprilTags found after {self._max_attempts} scans. Terminating.")
+            #         break
+
+            #     # Escalating sweep: 90°, 180°, 270°, 360°, 360°
+            #     yaw_deg = min(90 * self._attempts, 360)
+            #     # More steps for wider sweeps; clamp to something reasonable
+            #     steps = min(9 + 4 * self._attempts, 45)
+            #     # Slightly faster pauses as we escalate, but keep ≥ 0.4s
+            #     pause = max(0.4, 1.0 - 0.1 * self._attempts)
+
+            #     print(f"No AprilTags found. Sweeping yaw across ±{yaw_deg/2:.0f}° "
+            #         f"with {steps} steps (attempt {self._attempts}/{self._max_attempts})...")
+            #     self.sweep_yaw(yaw_range=math.radians(yaw_deg), steps=steps, pause=pause)
+
+    
+            #     # Uncomment the line below if you want this extra motion:
+            #     self.rotate_in_place(angle_rad=math.radians(90), angular_speed=0.8)
 
         # Power off at the conclusion of the example.
         if self._powered_on:
@@ -234,6 +297,102 @@ class FollowFiducial(object):
         """Power off the robot."""
         self._robot.power_off()
         print(f'Powered Off {not self._robot.is_powered_on()}')
+
+        # ---- WASD-style velocity helper & atomic moves ----
+    def _velocity_command(self, desc='', v_x=0.0, v_y=0.0, v_rot=0.0, duration=VELOCITY_CMD_DURATION):
+        if not (self._movement_on and self._powered_on):
+            print(f"Cannot {desc} — movement disabled or motors off.")
+            return
+        mobility_params = self.set_mobility_params()
+        vel_cmd = RobotCommandBuilder.synchro_velocity_command(
+            v_x=v_x, v_y=v_y, v_rot=v_rot,
+            frame_name=BODY_FRAME_NAME,
+            params=mobility_params,
+            body_height=0.0,
+            locomotion_hint=spot_command_pb2.HINT_AUTO,
+        )
+        try:
+            self._robot_command_client.robot_command(command=vel_cmd, end_time_secs=time.time() + duration)
+            time.sleep(duration)
+        finally:
+            try:
+                self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
+            except bosdyn.client.robot_command.ExpiredError:
+                pass
+
+    def move_forward(self):  self._velocity_command('move_forward',  v_x= VELOCITY_BASE_SPEED)
+
+    def move_backward(self): self._velocity_command('move_backward', v_x=-VELOCITY_BASE_SPEED)
+
+    def strafe_left(self):   self._velocity_command('strafe_left',   v_y= VELOCITY_BASE_SPEED)
+
+    def strafe_right(self):  self._velocity_command('strafe_right',  v_y=-VELOCITY_BASE_SPEED)
+
+    def turn_left(self):     self._velocity_command('turn_left',     v_rot= VELOCITY_BASE_ANGULAR)
+
+    def turn_right(self):    self._velocity_command('turn_right',    v_rot=-VELOCITY_BASE_ANGULAR)
+
+
+    def _announce_tag_prompt(self, infos):
+        # Called from the scan loop when we first see tags in manual mode.
+        ids = [i['id'] for i in infos]
+        closest = min(infos, key=lambda x: x['dist'])
+        print("\n[AprilTag] Detected IDs:", ids)
+        print(f"Closest: ID={closest['id']} at ~{closest['dist']:.2f} m.")
+        print("Press [F] to FOLLOW closest, or [C] to CONTINUE manual driving.")
+
+    def _pnp_each(self, bboxes, tag_ids):
+        """Compute PnP for each detection; return [{'id', 'tvec', 'dist'}]."""
+        out = []
+        camera = self.make_camera_matrix(self._intrinsics)
+        for idx, tag_id in enumerate(tag_ids):
+            obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
+            ok, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+            if not ok:
+                continue
+            dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
+            out.append({'id': int(tag_id), 'tvec': tvec, 'dist': dist_m})
+        return out
+
+    def on_tags_detected(self, bboxes, tag_ids, source_name):
+        """Called by the scan loop whenever tags are visible."""
+        if self.mode != 'manual':
+            return  # ignore while we're already prompting or following
+        infos = self._pnp_each(bboxes, tag_ids)
+        if not infos:
+            return
+        self._pending_detections = infos
+        self.mode = 'prompt'
+        self._announce_tag_prompt(infos)
+
+    def follow_detected_closest(self):
+        """Follow the closest of the last detected tags."""
+        if not self._pending_detections:
+            print("No pending detections.")
+            return
+        info = min(self._pending_detections, key=lambda x: x['dist'])
+        vision_pos = self.compute_fiducial_in_world_frame(info['tvec'])
+        fid_vec = geometry_pb2.Vec3(x=vision_pos[0], y=vision_pos[1], z=vision_pos[2])
+        print(f"\nFollowing AprilTag ID {info['id']} ...")
+        self.mode = 'following'
+        self.go_to_tag(fid_vec)
+        print(f"Reached tag ID {info['id']}. Manual mode restored.")
+        self._pending_detections = None
+        self.mode = 'manual'
+
+    def dismiss_prompt(self):
+        print("Continuing manual driving.")
+        self._pending_detections = None
+        self.mode = 'manual'
+
+    def cancel_follow(self):
+        """Abort an ongoing follow and go back to manual (mapped to [M])."""
+        try:
+            self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
+        finally:
+            self.mode = 'manual'
+            print("Follow cancelled. Manual mode.")
+
 
     def prompt_next_action(self):
         """Prompt the user for the next action."""
@@ -253,6 +412,39 @@ class FollowFiducial(object):
                 return action
             else:
                 print("Invalid input. Please enter one of: n, q, r, s, p.")
+    def prompt_follow_or_rotate(self, tag_ids):
+        """Ask whether to follow a visible tag or rotate to search for another."""
+        while True:
+            choice = input("\nDetected tags. Follow a tag [f] or rotate 90° to find another [r]? ").strip().lower()
+            if choice == 'f':
+                # If there's only one tag, follow it. Otherwise ask which ID.
+                if len(tag_ids) == 1:
+                    return ("follow", tag_ids[0])
+                else:
+                    while True:
+                        try:
+                            user_input = input(f"Enter the ID of the tag to follow from {tag_ids}: ").strip()
+                            chosen_tag_id = int(user_input)
+                            if chosen_tag_id in tag_ids:
+                                return ("follow", chosen_tag_id)
+                            print(f"Tag ID {chosen_tag_id} is not in {tag_ids}. Try again.")
+                        except Exception:
+                            print("Invalid input. Please enter a valid numeric tag ID.")
+            elif choice == 'r':
+                return ("rotate", None)
+            else:
+                print("Please enter 'f' to follow or 'r' to rotate.")
+
+    def print_detected_tags_with_distance(self, bboxes, tag_ids):
+        """Compute and print distances for currently detected tags."""
+        camera = self.make_camera_matrix(self._intrinsics)
+        print("\nDetected AprilTags in view:")
+        for idx, tag_id in enumerate(tag_ids):
+            obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
+            _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+            dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
+            print(f"  Tag {idx+1}: ID={tag_id}, Distance={dist_m:.2f} m")
+
 
     def rotate_in_place(self, angle_rad=math.pi/2, angular_speed=1): # angle_rad in radians, angle can be changed by changing pi/2
         """Rotate in place."""
@@ -282,6 +474,7 @@ class FollowFiducial(object):
 
     def sweep_yaw(self, yaw_range=math.radians(90), steps=9, pause=1.0):
         """Sweep Spot's body yaw left and right to look for AprilTags."""
+        self._previous_source = None # Next image will not pass to last camera source
         max_yaw = yaw_range / 2
         yaws = np.linspace(-max_yaw, max_yaw, steps)
         for yaw in yaws:
@@ -520,15 +713,11 @@ class FollowFiducial(object):
         return spot_command_pb2.BodyControlParams(base_offset_rt_footprint=traj)
 
     @staticmethod
+
+
     def rotate_image(image, source_name):
-        """Rotate the image so that it is always displayed upright."""
-        if source_name == 'frontleft_fisheye_image':
-            image = cv2.rotate(image, rotateCode=0)
-        elif source_name == 'right_fisheye_image':
-            image = cv2.rotate(image, rotateCode=1)
-        elif source_name == 'frontright_fisheye_image':
-            image = cv2.rotate(image, rotateCode=0)
-        return image
+        code = ROT_MAP.get(source_name)
+        return cv2.rotate(image, code) if code is not None else image
 
     @staticmethod
     def make_camera_matrix(ints):
@@ -537,6 +726,74 @@ class FollowFiducial(object):
                                   [ints.skew.y, ints.focal_length.y, ints.principal_point.y],
                                   [0, 0, 1]])
         return camera_matrix
+    
+class KeyboardController(threading.Thread):
+    """Non-blocking console keyboard for WASD + [F]/[C] prompt + [M] cancel."""
+    def __init__(self, follower: FollowFiducial):
+        super().__init__(daemon=True)
+        self.f = follower
+        self._stop = False
+        if not _WIN:
+            self._fd = sys.stdin.fileno()
+            self._old = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+
+    def stop(self):
+        self._stop = True
+
+    def _read_key(self):
+        if _WIN:
+            if msvcrt.kbhit():
+                return msvcrt.getwch()
+            return None
+        else:
+            r, _, _ = select.select([sys.stdin], [], [], 0)
+            if r:
+                return sys.stdin.read(1)
+            return None
+
+    def run(self):
+        try:
+            while not self._stop:
+                ch = self._read_key()
+                if not ch:
+                    time.sleep(0.03)
+                    continue
+
+                # Global escape hatch
+                if ch == '\x1b':  # ESC
+                    self.stop()
+                    continue
+
+                # If we're prompting: [F] follow, [C] continue
+                if self.f.mode == 'prompt':
+                    if ch.lower() == 'f':
+                        self.f.follow_detected_closest()
+                    elif ch.lower() == 'c':
+                        self.f.dismiss_prompt()
+                    continue
+
+                # If following: allow cancel with [M]
+                if self.f.mode == 'following':
+                    if ch.lower() == 'm':
+                        self.f.cancel_follow()
+                    continue
+
+                # Manual driving keys (nudges from wasd.py)
+                if   ch.lower() == 'w': self.f.move_forward()
+                elif ch.lower() == 's': self.f.move_backward()
+                elif ch.lower() == 'a': self.f.strafe_left()
+                elif ch.lower() == 'd': self.f.strafe_right()
+                elif ch.lower() == 'q': self.f.turn_left()
+                elif ch.lower() == 'e': self.f.turn_right()
+                # Optional: 'r' to enter search mode
+                elif ch.lower() == 'r':
+                    print("Search mode: rotating scan enabled.")
+                    self.f.mode = 'search'
+        finally:
+            if not _WIN:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+
 
 
 class DisplayImagesAsync(object):
@@ -610,22 +867,26 @@ class Exit(object):
         """Return if sigterm received and program should end."""
         return self._kill_now
 
-
 def main():
     """Command-line interface."""
     import argparse
 
     parser = argparse.ArgumentParser()
     bosdyn.client.util.add_base_arguments(parser)
-    parser.add_argument('--distance-margin', default=.25, ##default value by boston dynamic was 0.5
+    parser.add_argument('--distance-margin', default=.25,
                         help='Distance [meters] that the robot should stop from the AprilTag.')
     parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='If the robot should limit its maximum speed.')
-    parser.add_argument('--avoid-obstacles', default=True, type=lambda x:
-                        (str(x).lower() == 'true'),
+    parser.add_argument('--avoid-obstacles', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='If the robot should have obstacle avoidance enabled.')
     parser.add_argument('--show-preview', action='store_true', default=False,
-                    help='Show camera preview windows (default: False)')
+                        help='Show camera preview windows (default: False)')
+
+    # (Optional) if you added WASD CLI knobs in step 4, include them here too:
+    parser.add_argument('--vel-speed', type=float, default=VELOCITY_BASE_SPEED)
+    parser.add_argument('--vel-ang', type=float, default=VELOCITY_BASE_ANGULAR)
+    parser.add_argument('--vel-duration', type=float, default=VELOCITY_CMD_DURATION)
+
     options = parser.parse_args()
 
     sdk = create_standard_sdk('FollowFiducialClient')
@@ -633,6 +894,8 @@ def main():
 
     fiducial_follower = None
     image_viewer = None
+    kb = None  # <— keyboard thread handle
+
     try:
         with Exit():
             bosdyn.client.util.authenticate(robot)
@@ -640,24 +903,100 @@ def main():
 
             assert not robot.is_estopped(), 'Robot is estopped. Use E-Stop client to configure.'
 
+            # Build controller & follower
             fiducial_follower = FollowFiducial(robot, options)
+
+            # --- START KEYBOARD THREAD HERE ---
+            # This enables non-blocking WASD and [F]/[C] prompt handling while the main loop runs.
+            kb = KeyboardController(fiducial_follower)
+            kb.start()
+            # -----------------------------------
+
             time.sleep(.1)
+
             if str.lower(sys.platform) != 'darwin' and options.show_preview:
-                # Display the detected bounding boxes on the images when using the april tag library.
+                # Display the detected bounding boxes on the images.
                 image_viewer = DisplayImagesAsync(fiducial_follower)
                 image_viewer.start()
+
             lease_client = robot.ensure_client(LeaseClient.default_service_name)
-            with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True,
-                                                    return_at_exit=True):
+            with bosdyn.client.lease.LeaseKeepAlive(
+                lease_client, must_acquire=True, return_at_exit=True
+            ):
+                # This is your existing loop (now non-blocking thanks to the keyboard thread).
                 fiducial_follower.start()
+
     except RpcError as err:
         LOGGER.error('Failed to communicate with robot: %s', err)
+
     finally:
+        # Close preview windows if open
         if image_viewer is not None:
             image_viewer.stop()
 
+        # --- STOP KEYBOARD THREAD CLEANLY ---
+        if kb is not None:
+            kb.stop()
+            try:
+                kb.join(timeout=1.0)
+            except Exception:
+                pass
+        # ------------------------------------
+
     return False
+
 
 if __name__ == '__main__':
     if not main():
         sys.exit(1)
+
+# def main():
+#     """Command-line interface."""
+#     import argparse
+
+#     parser = argparse.ArgumentParser()
+#     bosdyn.client.util.add_base_arguments(parser)
+#     parser.add_argument('--distance-margin', default=.25, ##default value by boston dynamic was 0.5
+#                         help='Distance [meters] that the robot should stop from the AprilTag.')
+#     parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
+#                         help='If the robot should limit its maximum speed.')
+#     parser.add_argument('--avoid-obstacles', default=True, type=lambda x:
+#                         (str(x).lower() == 'true'),
+#                         help='If the robot should have obstacle avoidance enabled.')
+#     parser.add_argument('--show-preview', action='store_true', default=False,
+#                     help='Show camera preview windows (default: False)')
+#     options = parser.parse_args()
+
+#     sdk = create_standard_sdk('FollowFiducialClient')
+#     robot = sdk.create_robot(options.hostname)
+
+#     fiducial_follower = None
+#     image_viewer = None
+#     try:
+#         with Exit():
+#             bosdyn.client.util.authenticate(robot)
+#             robot.start_time_sync()
+
+#             assert not robot.is_estopped(), 'Robot is estopped. Use E-Stop client to configure.'
+
+#             fiducial_follower = FollowFiducial(robot, options)
+#             time.sleep(.1)
+#             if str.lower(sys.platform) != 'darwin' and options.show_preview:
+#                 # Display the detected bounding boxes on the images when using the april tag library.
+#                 image_viewer = DisplayImagesAsync(fiducial_follower)
+#                 image_viewer.start()
+#             lease_client = robot.ensure_client(LeaseClient.default_service_name)
+#             with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True,
+#                                                     return_at_exit=True):
+#                 fiducial_follower.start()
+#     except RpcError as err:
+#         LOGGER.error('Failed to communicate with robot: %s', err)
+#     finally:
+#         if image_viewer is not None:
+#             image_viewer.stop()
+
+#     return False
+
+# if __name__ == '__main__':
+#     if not main():
+#         sys.exit(1)
