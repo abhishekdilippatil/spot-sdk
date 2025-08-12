@@ -73,12 +73,16 @@ class FollowFiducial(object):
 
     def __init__(self, robot, options):
         # Robot instance variable.
-        self.mode = 'manual'           
+        self.mode = 'manual'  
+        self._prompt_cooldown_s = 4.0           # seconds to snooze prompts after dismiss/follow
+        self._suppress_prompt_until = 0.0       # wall-clock time until which we won't prompt
+        self._last_prompt_tag_ids = set()       # last tag-id set we prompted about         
         #for manual control
         self._pending_detections = None
         self._last_detected_tag_ids = []
         self._last_chosen_tag_id = None
         self._robot = robot
+        self._tag_detector = apriltag(families='tag36h11')
         self._robot_id = robot.ensure_client(RobotIdClient.default_service_name).get_id(timeout=0.4)
         self._power_client = robot.ensure_client(PowerClient.default_service_name)
         self._image_client = robot.ensure_client(ImageClient.default_service_name)
@@ -184,14 +188,19 @@ class FollowFiducial(object):
         while self._attempts <= self._max_attempts:
             bboxes, tag_ids, source_name = self.image_to_bounding_box()
             if bboxes and tag_ids:
+                if self.mode == 'search':             # <-- stop scanning if we found something
+                    self.mode = 'manual'
+                    self._attempts = 0
                 self._previous_source = source_name
                 self.on_tags_detected(bboxes, tag_ids, source_name)
             else:
                 # Only auto-scan if we're not in manual driving (e.g., after user asked to search)
-                if self.mode != 'manual':
+                if self.mode == 'search':
                     print("No AprilTags found. Rotating to scan...")
                     self.sweep_yaw()
                     self._attempts += 1
+                # Reset prompt memory when tags vanish:
+                self._last_prompt_tag_ids = set()
 
             # Optional: a tiny sleep so the keyboard thread gets CPU time.
             time.sleep(0.02)
@@ -340,6 +349,8 @@ class FollowFiducial(object):
         print("\n[AprilTag] Detected IDs:", ids)
         print(f"Closest: ID={closest['id']} at ~{closest['dist']:.2f} m.")
         print("Press [F] to FOLLOW closest, or [C] to CONTINUE manual driving.")
+        # brief pause to avoid flicker/re-announce
+        self._suppress_prompt_until = time.time() + 0.25
 
     def _pnp_each(self, bboxes, tag_ids):
         """Compute PnP for each detection; return [{'id', 'tvec', 'dist'}]."""
@@ -347,23 +358,46 @@ class FollowFiducial(object):
         camera = self.make_camera_matrix(self._intrinsics)
         for idx, tag_id in enumerate(tag_ids):
             obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
-            ok, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+            ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                obj_points, img_points, camera, np.zeros((5, 1)),
+                flags=cv2.SOLVEPNP_ITERATIVE, reprojectionError=3.0
+            )
+
             if not ok:
                 continue
             dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
-            out.append({'id': int(tag_id), 'tvec': tvec, 'dist': dist_m})
+            out.append({'id': int(tag_id),
+            'tvec': tvec,
+            'dist': dist_m,
+            # capture transforms used for THIS frame (race free)
+            'camera_tform_body': self._camera_tform_body,
+            'body_tform_world':  self._body_tform_world})
         return out
-
     def on_tags_detected(self, bboxes, tag_ids, source_name):
         """Called by the scan loop whenever tags are visible."""
-        if self.mode != 'manual':
+        now = time.time()
+
+        # Do not interrupt manual driving while we're within the snooze window.
+        if now < self._suppress_prompt_until:
+            return
+
+        # Only prompt once per 'visibility episode' (IDs unchanged → no new prompt).
+        ids_set = set(int(t) for t in tag_ids)
+        if ids_set == self._last_prompt_tag_ids:
+            return
+
+        if self.mode not in ('manual', 'search'):
             return  # ignore while we're already prompting or following
+
         infos = self._pnp_each(bboxes, tag_ids)
         if not infos:
             return
+
         self._pending_detections = infos
+        self._last_prompt_tag_ids = ids_set
         self.mode = 'prompt'
         self._announce_tag_prompt(infos)
+
 
     def follow_detected_closest(self):
         """Follow the closest of the last detected tags."""
@@ -371,19 +405,33 @@ class FollowFiducial(object):
             print("No pending detections.")
             return
         info = min(self._pending_detections, key=lambda x: x['dist'])
-        vision_pos = self.compute_fiducial_in_world_frame(info['tvec'])
+
+        # stop any residual nudge before we send a trajectory
+        try:
+            self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
+        except Exception:
+            pass
+
+        vision_pos = self.compute_fiducial_in_world_frame(
+            info['tvec'],
+            camera_tform_body=info['camera_tform_body'],
+        body_tform_world=info['body_tform_world']
+        )
         fid_vec = geometry_pb2.Vec3(x=vision_pos[0], y=vision_pos[1], z=vision_pos[2])
+
         print(f"\nFollowing AprilTag ID {info['id']} ...")
         self.mode = 'following'
         self.go_to_tag(fid_vec)
         print(f"Reached tag ID {info['id']}. Manual mode restored.")
         self._pending_detections = None
         self.mode = 'manual'
+        self._suppress_prompt_until = time.time() + self._prompt_cooldown_s
 
     def dismiss_prompt(self):
         print("Continuing manual driving.")
         self._pending_detections = None
         self.mode = 'manual'
+        self._suppress_prompt_until = time.time() + self._prompt_cooldown_s
 
     def cancel_follow(self):
         """Abort an ongoing follow and go back to manual (mapped to [M])."""
@@ -391,6 +439,7 @@ class FollowFiducial(object):
             self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
         finally:
             self.mode = 'manual'
+            self._suppress_prompt_until = time.time() + self._prompt_cooldown_s
             print("Follow cancelled. Manual mode.")
 
 
@@ -566,15 +615,15 @@ class FollowFiducial(object):
 
     def detect_fiducial_in_image(self, image, dim, source_name):
         """Detect the AprilTag within a single image and return its bounding box."""
-        image_grey = np.array(
-        Image.frombytes('P', (int(dim[0]), int(dim[1])), data=image.data, decoder_name='raw'))
+        w, h = int(dim[0]), int(dim[1])
+        image_grey = np.frombuffer(image.data, dtype=np.uint8).reshape(h, w)
+
 
         #Rotate each image such that it is upright
         image_grey = self.rotate_image(image_grey, source_name)
 
         #Make the image greyscale to use bounding box detections
-        detector = apriltag(families='tag36h11')
-        detections = detector.detect(image_grey)
+        detections = self._tag_detector.detect(image_grey)
 
         bboxes = []
         tag_ids = []
@@ -604,17 +653,14 @@ class FollowFiducial(object):
                             [bbox[0][0], bbox[0][1]], [bbox[1][0], bbox[1][1]]], dtype=np.float32)
         return obj_points, img_pts
 
-    def compute_fiducial_in_world_frame(self, tvec):
+    def compute_fiducial_in_world_frame(self, tvec, camera_tform_body=None, body_tform_world=None):
         """Transform the tag position from camera coordinates to world coordinates."""
-        fiducial_rt_camera_frame = np.array(
-            [float(tvec[0][0]) / 1000.0,
-             float(tvec[1][0]) / 1000.0,
-             float(tvec[2][0]) / 1000.0])
-        body_tform_fiducial = (self._camera_tform_body.inverse()).transform_point(
-            fiducial_rt_camera_frame[0], fiducial_rt_camera_frame[1], fiducial_rt_camera_frame[2])
-        fiducial_rt_world = self._body_tform_world.inverse().transform_point(
-            body_tform_fiducial[0], body_tform_fiducial[1], body_tform_fiducial[2])
-        return fiducial_rt_world
+        ct_b = camera_tform_body or self._camera_tform_body
+        b_t_w = body_tform_world  or self._body_tform_world
+        fid_cam = np.array([float(tvec[0][0])/1000.0, float(tvec[1][0])/1000.0, float(tvec[2][0])/1000.0])
+        body_xyz = (ct_b.inverse()).transform_point(fid_cam[0], fid_cam[1], fid_cam[2])
+        world_xyz = (b_t_w.inverse()).transform_point(body_xyz[0], body_xyz[1], body_xyz[2])
+        return world_xyz
 
     def go_to_tag(self, fiducial_rt_world):
         """Use the position of the april tag in vision world frame and command the robot."""
@@ -767,10 +813,19 @@ class KeyboardController(threading.Thread):
 
                 # If we're prompting: [F] follow, [C] continue
                 if self.f.mode == 'prompt':
-                    if ch.lower() == 'f':
-                        self.f.follow_detected_closest()
-                    elif ch.lower() == 'c':
-                        self.f.dismiss_prompt()
+                    if   ch.lower() == 'f': self.f.follow_detected_closest(); continue
+                    elif ch.lower() == 'c': self.f.dismiss_prompt(); continue
+                    # Also accept nudges during prompt:
+                    elif ch.lower() == 'w': self.f.move_forward();  continue
+                    elif ch.lower() == 's': self.f.move_backward(); continue
+                    elif ch.lower() == 'a': self.f.strafe_left();   continue
+                    elif ch.lower() == 'd': self.f.strafe_right();  continue
+                    elif ch.lower() == 'q': self.f.turn_left();     continue
+                    elif ch.lower() == 'e': self.f.turn_right();    continue
+                    elif ch.lower() == 't':
+                        print("Manual mode.")
+                        self.f.mode = 'manual'
+
                     continue
 
                 # If following: allow cancel with [M]
@@ -882,7 +937,7 @@ def main():
     parser.add_argument('--show-preview', action='store_true', default=False,
                         help='Show camera preview windows (default: False)')
 
-    # (Optional) if you added WASD CLI knobs in step 4, include them here too:
+    # adding WASD CLI knobs
     parser.add_argument('--vel-speed', type=float, default=VELOCITY_BASE_SPEED)
     parser.add_argument('--vel-ang', type=float, default=VELOCITY_BASE_ANGULAR)
     parser.add_argument('--vel-duration', type=float, default=VELOCITY_CMD_DURATION)
