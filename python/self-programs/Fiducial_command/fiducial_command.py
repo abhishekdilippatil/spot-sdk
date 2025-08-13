@@ -96,6 +96,7 @@ class FollowFiducial(object):
         self.mode = 'manual'
 
         self._robot = robot
+        self._tag_detector = apriltag(families='tag36h11')
         self._robot_id = robot.ensure_client(RobotIdClient.default_service_name).get_id(timeout=0.4)
         self._power_client = robot.ensure_client(PowerClient.default_service_name)
         self._image_client = robot.ensure_client(ImageClient.default_service_name)
@@ -325,7 +326,6 @@ class FollowFiducial(object):
             dist_m = math.sqrt(tx*tx + ty*ty + tz*tz) / 1000.0  # mm -> m
             out.append({'id': int(tag_id), 'tvec': tvec, 'dist': dist_m})
         return out
-
     def on_tags_detected(self, bboxes, tag_ids, source_name):
         if self.mode != 'manual':
             return
@@ -336,6 +336,7 @@ class FollowFiducial(object):
             self._pending_detections = infos
         self.mode = 'prompt'
         self._announce_tag_prompt(infos)
+
 
     def follow_detected_closest(self):
         with self._pending_lock:
@@ -353,12 +354,14 @@ class FollowFiducial(object):
         with self._pending_lock:
             self._pending_detections = None
         self.mode = 'manual'
+        self._suppress_prompt_until = time.time() + self._prompt_cooldown_s
 
     def dismiss_prompt(self):
         status.note("Continuing manual driving.")
         with self._pending_lock:
             self._pending_detections = None
         self.mode = 'manual'
+        self._suppress_prompt_until = time.time() + self._prompt_cooldown_s
 
     def cancel_follow(self):
         try:
