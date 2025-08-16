@@ -5,6 +5,8 @@
 # Development Kit License (20191101-BDSDK-SL).
 
 """ Detect and follow fiducial tags. """
+import argparse
+import curses
 import logging
 import math
 import signal
@@ -34,6 +36,7 @@ from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient,
 from bosdyn.client.robot_id import RobotIdClient, version_tuple
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.world_object import WorldObjectClient
+from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
 
 #pylint: disable=no-member
 LOGGER = logging.getLogger()
@@ -154,7 +157,6 @@ class FollowFiducial(object):
 
     def start(self):
         """Claim lease of robot and start the fiducial follower."""
-        self._robot.time_sync.wait_for_sync()
 
         # Stand the robot up.
         if self._standup:
@@ -216,6 +218,11 @@ class FollowFiducial(object):
 
     def power_on(self):
         """Power on the robot."""
+        # If already powered, don't repeat.
+        if self._robot.is_powered_on():
+            self._powered_on = True
+            print(f'Powered On {self._robot.is_powered_on()}')
+            return
         self._robot.power_on()
         self._powered_on = True
         print(f'Powered On {self._robot.is_powered_on()}')
@@ -223,6 +230,7 @@ class FollowFiducial(object):
     def power_off(self):
         """Power off the robot."""
         self._robot.power_off()
+        self._powered_on = False
         print(f'Powered Off {not self._robot.is_powered_on()}')
 
     def image_to_bounding_box(self):
@@ -276,14 +284,16 @@ class FollowFiducial(object):
         image_grey = self.rotate_image(image_grey, source_name)
 
         #Make the image greyscale to use bounding box detections
-        detector = apriltag(family='tag36h11')
+        detector = AprilTagDetector(families='tag36h11')
         detections = detector.detect(image_grey)
 
         bboxes = []
-        for i in range(len(detections)):
-            # Draw the bounding box detection in the image.
-            bbox = detections[i]['lb-rb-rt-lt']
-            cv2.polylines(image_grey, [np.int32(bbox)], True, (0, 0, 0), 2)
+        for det in detections:
+            # corners order: [TL, TR, BR, BL]
+            corners = det.corners.astype(np.float32)
+            # Your downstream expects [LB, RB, RT, LT] -> [BL, BR, TR, TL] -> [3,2,1,0]
+            bbox = np.array([corners[3], corners[2], corners[1], corners[0]], dtype=np.float32)
+            cv2.polylines(image_grey, [bbox.astype(np.int32)], True, (0, 0, 0), 2)
             bboxes.append(bbox)
 
         self._image[source_name] = image_grey
@@ -352,7 +362,7 @@ class FollowFiducial(object):
 
     def go_to_tag(self, fiducial_rt_world):
         """Use the position of the april tag in vision world frame and command the robot."""
-        # Compute the go-to point (offset by .5m from the fiducial position) and the heading at
+        # Compute the go-to point (offset by .15m from the fiducial position) and the heading at
         # this point.
         self._current_tag_world_pose, self._angle_desired = self.offset_tag_pose(
             fiducial_rt_world, self._tag_offset)
@@ -540,6 +550,23 @@ class Exit(object):
         """Return if sigterm received and program should end."""
         return self._kill_now
 
+def setup_estop(robot, endpoint_name='follow_fiducial_estop', timeout_sec=9.0):
+    """
+    Register a single software E-Stop endpoint and start a keepalive.
+    Returns (estop_client, estop_endpoint, estop_keepalive).
+    """
+    estop_client = robot.ensure_client(EstopClient.default_service_name)
+    endpoint = EstopEndpoint(estop_client=estop_client,
+                             name=endpoint_name,
+                             timeout_sec=timeout_sec)
+    # Make this the sole endpoint in a simple config and register it.
+    endpoint.force_simple_setup()  # creates new config, registers, and checks in
+    keepalive = EstopKeepAlive(estop_client=estop_client, endpoint=endpoint)
+
+    # Allow motion (set stop level NONE). This does NOT power on motors.
+    keepalive.allow()
+    return estop_client, endpoint, keepalive
+
 
 def main():
     """Command-line interface."""
@@ -562,8 +589,8 @@ def main():
     # If requested, attempt import of Apriltag library
     if not options.use_world_objects:
         try:
-            global apriltag
-            from apriltag import apriltag
+            global AprilTagDetector
+            from pupil_apriltags import Detector as AprilTagDetector # using pupil_apriltags
         except ImportError as e:
             print(f'Could not import the AprilTag library. Aborting. Exception: {e}')
             return False
@@ -574,10 +601,12 @@ def main():
 
     fiducial_follower = None
     image_viewer = None
+    estop_keepalive = None
     try:
         with Exit():
             bosdyn.client.util.authenticate(robot)
             robot.start_time_sync()
+            robot.time_sync.wait_for_sync(timeout_sec=3.0)
 
             # Verify the robot is not estopped.
             assert not robot.is_estopped(), 'Robot is estopped. ' \
@@ -594,12 +623,38 @@ def main():
             lease_client = robot.ensure_client(LeaseClient.default_service_name)
             with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True,
                                                     return_at_exit=True):
-                fiducial_follower.start()
+                # After E-Stop is allowed and lease is held, create follower.
+                fiducial_follower = FollowFiducial(robot, options)
+
+                # Optional image viewer (disabled on macOS).
+                if not options.use_world_objects and str.lower(sys.platform) != 'darwin':
+                    image_viewer = DisplayImagesAsync(fiducial_follower)
+                    image_viewer.start()
+
+                # Power on & do the job inside start(); ensures power on happens
+                # AFTER E-Stop allow() and WITH an active Lease.
+                try:
+                    fiducial_follower.start()
+                finally:
+                    # Ensure motors are off before we drop Lease or E-Stop.
+                    if fiducial_follower is not None and fiducial_follower._powered_on:
+                        try:
+                            fiducial_follower.power_off()
+                        except Exception as _e:  # best-effort power off
+                            LOGGER.warning("Power off failed during cleanup: %r", _e)
+
     except RpcError as err:
         LOGGER.error('Failed to communicate with robot: %s', err)
     finally:
         if image_viewer is not None:
             image_viewer.stop()
+
+        # Deregister the E-Stop endpoint cleanly so the robot is not left estopped by timeout.
+        if estop_keepalive is not None:
+            try:
+                estop_keepalive.shutdown()  # deregisters endpoint and stops check-ins
+            except Exception as _e:
+                LOGGER.warning("E-Stop shutdown encountered an issue: %r", _e)
 
     return False
 
