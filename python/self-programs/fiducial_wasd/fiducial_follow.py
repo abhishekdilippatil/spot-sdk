@@ -7,34 +7,26 @@
 """ Detect and follow fiducial tags. """
 import logging
 import math
-import signal
-import sys
-import threading
 import time
-from sys import platform
 
 import cv2
 import numpy as np
 from PIL import Image
 
-import bosdyn.client
-import bosdyn.client.util
 from bosdyn import geometry
 from bosdyn.api import geometry_pb2, image_pb2, trajectory_pb2, world_object_pb2
 from bosdyn.api.geometry_pb2 import SE2Velocity, SE2VelocityLimit, Vec2
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
-from bosdyn.client import ResponseError, RpcError, create_standard_sdk
 from bosdyn.client.frame_helpers import (BODY_FRAME_NAME, VISION_FRAME_NAME, get_a_tform_b,
                                          get_vision_tform_body)
 from bosdyn.client.image import ImageClient, build_image_request
-from bosdyn.client.lease import LeaseClient
-from bosdyn.client.math_helpers import Quat, SE3Pose
+from bosdyn.client.math_helpers import Quat
 from bosdyn.client.power import PowerClient
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
 from bosdyn.client.robot_id import RobotIdClient, version_tuple
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.world_object import WorldObjectClient
-from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
+from pupil_apriltags import Detector as AprilTagDetector
 
 #pylint: disable=no-member
 LOGGER = logging.getLogger()
@@ -192,16 +184,11 @@ class FollowFiducial(object):
 
             if detected_fiducial:
                 # Go to the tag and stop within a certain distance
-                print(f'Found fiducial {fiducial.apriltag_properties.tag_id}')
                 self.go_to_tag(fiducial_rt_world)
             else:
                 print('No fiducials found')
 
             self._attempts += 1  #increment attempts at finding a fiducial
-
-        # Power off at the conclusion of the example.
-        if self._powered_on:
-            self.power_off()
 
     def get_fiducial_objects(self):
         """Get all fiducials that Spot detects with its perception system."""
@@ -474,219 +461,3 @@ class FollowFiducial(object):
                                   [ints.skew.y, ints.focal_length.y, ints.principal_point.y],
                                   [0, 0, 1]])
         return camera_matrix
-
-
-class DisplayImagesAsync(object):
-    """Display the images Spot sees from all five cameras."""
-
-    def __init__(self, fiducial_follower, viewer_sources=None, scale=0.5):
-        self._fiducial_follower = fiducial_follower
-        self._image_client = fiducial_follower._image_client
-        self._thread = None
-        self._started = False
-
-        all_sources = fiducial_follower.image_sources_list
-        # Keep a small, useful default set to avoid heavy bandwidth; include hand_color if present.
-        default_sources = [s for s in all_sources
-                           if s in ['frontleft_fisheye_image',
-                                    'frontright_fisheye_image',
-                                    'left_fisheye_image',
-                                    'right_fisheye_image',
-                                    'back_fisheye_image',
-                                    'hand_color_image']]
-        self._sources = viewer_sources if viewer_sources else (default_sources or all_sources)
-        self._scale = float(scale)
-
-    def start(self):
-        """Initialize the thread to display the images."""
-        if self._started:
-            return None
-        self._started = True
-        self._thread = threading.Thread(target=self.update, daemon=True)
-        self._thread.start()
-        return self
-
-    def _fetch_bgr(self, source_name):
-        # Request JPEG (color when available; mono remains mono).
-        req = build_image_request(
-            source_name,
-            quality_percent=100,
-            image_format=image_pb2.Image.FORMAT_JPEG
-        )
-        resp = self._image_client.get_image([req])[0]
-
-        # Decode bytes to BGR for display.
-        buf = np.frombuffer(resp.shot.image.data, dtype=np.uint8)
-        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if bgr is None:
-            return None
-
-        # Rotate for correct orientation.
-        bgr = self._fiducial_follower.rotate_image(bgr, source_name)
-
-        # (Optional) keep a copy in follower for any other consumer
-        self._fiducial_follower._image[source_name] = bgr
-        return bgr
-
-    def update(self):
-        idx = 0
-        while self._started and len(self._sources) > 0:
-            src = self._sources[idx % len(self._sources)]
-            frame = self._fetch_bgr(src)
-            if frame is not None:
-                h, w = frame.shape[:2]
-                resized = cv2.resize(frame, (int(w * self._scale), int(h * self._scale)),
-                                     interpolation=cv2.INTER_NEAREST)
-                cv2.imshow(src, resized)
-                cv2.moveWindow(src, int((idx % len(self._sources)) * w * self._scale), 0)
-                cv2.waitKey(1)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:  # ESC or 'q' to quit
-                    self.stop()
-                    break
-            idx += 1
-            time.sleep(0.03)  # throttle a bit to avoid saturating link/CPU
-
-    def stop(self):
-        """Stop the thread and the image displays."""
-        self._started = False
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-
-        # Wait briefly for the background thread to end
-        if self._thread is not None:
-            try:
-                self._thread.join(timeout=1.0)
-            except Exception:
-                pass
-            self._thread = None
-
-
-class Exit(object):
-    """Handle exiting on SIGTERM."""
-
-    def __init__(self):
-        self._kill_now = False
-        signal.signal(signal.SIGTERM, self._sigterm_handler)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, _type, _value, _traceback):
-        return False
-
-    def _sigterm_handler(self, _signum, _frame):
-        self._kill_now = True
-
-    @property
-    def kill_now(self):
-        """Return if sigterm received and program should end."""
-        return self._kill_now
-
-def setup_estop(robot, endpoint_name='follow_fiducial_estop', timeout_sec=9.0):
-    """
-    Register a single software E-Stop endpoint and start a keepalive.
-    Returns (estop_client, estop_endpoint, estop_keepalive).
-    """
-    estop_client = robot.ensure_client(EstopClient.default_service_name)
-    endpoint = EstopEndpoint(estop_client=estop_client,
-                             name=endpoint_name,
-                             timeout_sec=timeout_sec)
-    # Make this the sole endpoint in a simple config and register it.
-    endpoint.force_simple_setup()  # creates new config, registers, and checks in
-    keepalive = EstopKeepAlive(estop_client=estop_client, endpoint=endpoint)
-
-    # Allow motion (set stop level NONE). This does NOT power on motors.
-    keepalive.allow()
-    return estop_client, endpoint, keepalive
-
-
-def main():
-    """Command-line interface."""
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    bosdyn.client.util.add_base_arguments(parser)
-    parser.add_argument('--distance-margin', default=.15, #default value by boston dynamic was 0.5
-                        help='Distance [meters] that the robot should stop from the fiducial.')
-    parser.add_argument('--limit-speed', default=True, type=lambda x: (str(x).lower() == 'true'),
-                        help='If the robot should limit its maximum speed.')
-    parser.add_argument('--avoid-obstacles', default=True, type=lambda x:
-                        (str(x).lower() == 'true'),
-                        help='If the robot should have obstacle avoidance enabled.')
-    parser.add_argument(
-        '--use-world-objects', default=True, type=lambda x: (str(x).lower() == 'true'),
-        help='If fiducials should be from the world object service or the apriltag library.')
-    options = parser.parse_args()
-
-    # If requested, attempt import of Apriltag library
-    if not options.use_world_objects:
-        try:
-            global AprilTagDetector
-            from pupil_apriltags import Detector as AprilTagDetector # using pupil_apriltags
-        except ImportError as e:
-            print(f'Could not import the AprilTag library. Aborting. Exception: {e}')
-            return False
-
-    # Create robot object.
-    sdk = create_standard_sdk('FollowFiducialClient')
-    robot = sdk.create_robot(options.hostname)
-
-    fiducial_follower = None
-    image_viewer = None
-    estop_keepalive = None
-    try:
-        with Exit():
-            bosdyn.client.util.authenticate(robot)
-            robot.start_time_sync()
-            robot.time_sync.wait_for_sync(timeout_sec=3.0)
-
-            # Verify the robot is not estopped.
-            assert not robot.is_estopped(), 'Robot is estopped. ' \
-                                            'Please use an external E-Stop client, ' \
-                                            'such as the estop SDK example, to configure E-Stop.'
-
-            lease_client = robot.ensure_client(LeaseClient.default_service_name)
-            with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True,
-                                                    return_at_exit=True):
-                # After E-Stop is allowed and lease is held, create follower.
-                fiducial_follower = FollowFiducial(robot, options)
-                time.sleep(.1)
-
-                # Optional image viewer (disabled on macOS).
-                image_viewer = DisplayImagesAsync(fiducial_follower)
-                image_viewer.start()
-
-                # Power on & do the job inside start(); ensures power on happens
-                # AFTER E-Stop allow() and WITH an active Lease.
-                try:
-                    fiducial_follower.start()
-                finally:
-                    # Ensure motors are off before we drop Lease or E-Stop.
-                    if fiducial_follower is not None and fiducial_follower._powered_on:
-                        try:
-                            fiducial_follower.power_off()
-                        except Exception as _e:  # best-effort power off
-                            LOGGER.warning("Power off failed during cleanup: %r", _e)
-
-    except RpcError as err:
-        LOGGER.error('Failed to communicate with robot: %s', err)
-    finally:
-        if image_viewer is not None:
-            image_viewer.stop()
-
-        # Deregister the E-Stop endpoint cleanly so the robot is not left estopped by timeout.
-        if estop_keepalive is not None:
-            try:
-                estop_keepalive.shutdown()  # deregisters endpoint and stops check-ins
-            except Exception as _e:
-                LOGGER.warning("E-Stop shutdown encountered an issue: %r", _e)
-
-    return False
-
-
-if __name__ == '__main__':
-    if not main():
-        sys.exit(1)
