@@ -110,6 +110,8 @@ class FollowFiducial(object):
 
         # Dictionary mapping camera source to it's latest image taken.
         self._image = dict()
+        
+        self._stop = threading.Event()  # Event to stop the robot.
 
         # List of all possible camera sources.
         self._source_names = [
@@ -155,7 +157,7 @@ class FollowFiducial(object):
 
     def start(self):
         """Claim lease of robot and start the fiducial follower."""
-
+        self._stop.clear()
         # Stand the robot up.
         if self._standup:
             self.power_on()
@@ -164,7 +166,7 @@ class FollowFiducial(object):
             # Delay grabbing image until spot is standing (or close enough to upright).
             time.sleep(.35)
 
-        while self._attempts <= self._max_attempts:
+        while not self._stop.is_set() and self._attempts <= self._max_attempts:
             detected_fiducial = False
             fiducial_rt_world = None
             if self._use_world_object_service:
@@ -202,6 +204,10 @@ class FollowFiducial(object):
         # Power off at the conclusion of the example.
         if self._powered_on:
             self.power_off()
+
+    def stop(self):
+        self._movement_on = False
+        self._stop.set()
 
     def get_fiducial_objects(self):
         """Get all fiducials that Spot detects with its perception system."""
@@ -484,6 +490,8 @@ class DisplayImagesAsync(object):
         self._image_client = fiducial_follower._image_client
         self._thread = None
         self._started = False
+        self._stop = threading.Event()
+        self._window_names = []
 
         all_sources = fiducial_follower.image_sources_list
         # Keep a small, useful default set to avoid heavy bandwidth; include hand_color if present.
@@ -530,10 +538,14 @@ class DisplayImagesAsync(object):
 
     def update(self):
         idx = 0
-        while self._started and len(self._sources) > 0:
+        while not self._stop.is_set()  and len(self._sources) > 0:
             src = self._sources[idx % len(self._sources)]
             frame = self._fetch_bgr(src)
             if frame is not None:
+                if src not in self._window_names:
+                    # Create named window so we can reliably destroy it.
+                        cv2.namedWindow(src, cv2.WINDOW_NORMAL)
+                        self._window_names.append(src)
                 h, w = frame.shape[:2]
                 resized = cv2.resize(frame, (int(w * self._scale), int(h * self._scale)),
                                      interpolation=cv2.INTER_NEAREST)
@@ -541,8 +553,8 @@ class DisplayImagesAsync(object):
                 cv2.moveWindow(src, int((idx % len(self._sources)) * w * self._scale), 0)
                 cv2.waitKey(1)
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:  # ESC or 'q' to quit
-                    self.stop()
+                if key in (27, ord('q')):
+                    self._stop.set()
                     break
             idx += 1
             time.sleep(0.03)  # throttle a bit to avoid saturating link/CPU

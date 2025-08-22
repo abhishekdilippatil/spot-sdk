@@ -14,19 +14,82 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+import locale
+locale.setlocale(locale.LC_ALL, '')  # better width handling for unicode/wide chars
+from types import SimpleNamespace
 
+import bosdyn.api.basic_command_pb2 as basic_command_pb2
+import bosdyn.api.spot.robot_command_pb2 as spot_command_pb2
+import bosdyn.api.robot_state_pb2 as robot_state_proto
+import bosdyn.api.power_pb2 as PowerServiceProto
+import bosdyn
+import bosdyn.client.util
 from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
-from bosdyn.client.robot_command import RobotCommandClient
+from bosdyn.client.exceptions import ResponseError, RpcError
+from bosdyn.client.frame_helpers import ODOM_FRAME_NAME
+from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.power import PowerClient
+from bosdyn.client.sdk import create_standard_sdk
 from bosdyn.client.time_sync import TimeSyncError
 from bosdyn.client.async_tasks import AsyncGRPCTask, AsyncPeriodicQuery, AsyncTasks
+from bosdyn.client.lease import Error as LeaseBaseError
+from bosdyn.util import duration_str, format_metric, secs_to_hms
 
+from fiducial_follow import FollowFiducial, DisplayImagesAsync
+
+VELOCITY_BASE_SPEED = 0.5  # m/s
+VELOCITY_BASE_ANGULAR = 0.8  # rad/sec
+VELOCITY_CMD_DURATION = 0.6  # seconds
 COMMAND_INPUT_RATE = 0.1
 
 #pylint: disable=no-member
 LOGGER = logging.getLogger()
+
+def _safe_addstr(win, y, x, s):
+    """Write string safely within window bounds, clipping if needed."""
+    if s is None:
+        return
+    try:
+        max_y, max_x = win.getmaxyx()
+    except curses.error:
+        return
+    if y < 0 or x < 0 or y >= max_y:
+        return
+    # Leave the last column free to avoid bottom-right ERR
+    avail = max_x - x - 1
+    if avail <= 0:
+        return
+    try:
+        win.addnstr(y, x, str(s), avail)
+    except curses.error:
+        # Ignore sporadic errors (e.g., during console resize)
+        pass
+
+def _ensure_min_size(stdscr, min_rows=17, min_cols=600):
+    """Show a single-line warning if terminal is too small."""
+    try:
+        max_y, max_x = stdscr.getmaxyx()
+    except curses.error:
+        return False
+    if max_y < min_rows or max_x < min_cols:
+        stdscr.clear()
+        _safe_addstr(stdscr, 0, 0,
+            f"Terminal too small ({max_y}x{max_x}). "
+            f"Resize to at least {min_rows}x{min_cols}.")
+        stdscr.refresh()
+        return False
+    return True
+
+def _try_resize(stdscr, rows=40, cols=300):
+    """Best-effort resize; safe to call on platforms that support it."""
+    try:
+        curses.resizeterm(rows, cols)  # safer than stdscr.resize on Windows
+        stdscr.clear()
+    except curses.error:
+        # Ignore if not supported / console can't be resized
+        pass
 
 class ExitCheck(object):
     """A class to help exiting a loop, also capturing SIGTERM to exit the loop."""
@@ -58,14 +121,14 @@ class ExitCheck(object):
 class CursesHandler(logging.Handler):
     """logging handler which puts messages into the curses interface"""
 
-    def __init__(self, wasd_interface):
+    def __init__(self, spot_interface):
         super(CursesHandler, self).__init__()
-        self._wasd_interface = wasd_interface
+        self._spot_interface = spot_interface
 
     def emit(self, record):
         msg = record.getMessage()
         msg = msg.replace('\n', ' ').replace('\r', '')
-        self._wasd_interface.add_message(f'{record.levelname:s} {msg:s}')
+        self._spot_interface.add_message(f'{record.levelname:s} {msg:s}')
 
 
 class AsyncRobotState(AsyncPeriodicQuery):
@@ -96,7 +159,7 @@ class KyeboardSpotManager(object):
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._robot_state_task = AsyncRobotState(self._robot_state_client)
-        self._async_tasks = AsyncTasks([self._robot_state_task, self._image_task])
+        self._async_tasks = AsyncTasks([self._robot_state_task])
         self._lock = threading.Lock()
         self._command_dictionary = {
             27: self._stop,  # ESC key
@@ -109,11 +172,22 @@ class KyeboardSpotManager(object):
             ord('v'): self._sit,
             ord('b'): self._battery_change_pose,
             ord('f'): self._stand,
-            ord('l'): self._toggle_lease
+            ord('w'): self._move_forward,
+            ord('s'): self._move_backward,
+            ord('a'): self._strafe_left,
+            ord('d'): self._strafe_right,
+            ord('q'): self._turn_left,
+            ord('e'): self._turn_right,
+            ord('l'): self._toggle_lease,
+            ord('i'): self._toggle_camera_viewer,  # start/stop camera streaming
+            ord('o'): self._toggle_fiducial_follow
         }
         self._locked_messages = ['', '', '']  # string: displayed message for user
         self._estop_keepalive = None
         self._exit_check = None
+        self._fiducial = None
+        self._fid_thread = None
+        self._viewer = None
 
         # Stuff that is set in start()
         self._robot_id = None
@@ -132,12 +206,33 @@ class KyeboardSpotManager(object):
 
     def shutdown(self):
         """Release control of robot as gracefully as possible."""
-        LOGGER.info('Shutting down WasdInterface.')
+        LOGGER.info('Shutting down KeyboardSpotManager.')
         if self._estop_keepalive:
             # This stops the check-in thread but does not stop the robot.
             self._estop_keepalive.shutdown()
         if self._lease_keepalive:
             self._lease_keepalive.shutdown()
+        
+        # stop camera viewer if running
+        if getattr(self, "_viewer", None) is not None:
+            try:
+                self._viewer.stop()
+            except Exception:
+                pass
+            self._viewer = None
+
+        # stop fiducial follower if running
+        if getattr(self, "_fiducial", None) is not None:
+            try:
+                self._fiducial.stop()
+            except Exception:
+                pass
+            if getattr(self, "_fid_thread", None) is not None:
+                try:
+                    self._fid_thread.join(timeout=2.0)
+                except Exception:
+                    pass
+                self._fid_thread = None
 
     def flush_and_estop_buffer(self, stdscr):
         """Manually flush the curses input buffer but trigger any estop requests (space)"""
@@ -169,15 +264,19 @@ class KyeboardSpotManager(object):
             curses_handler.setLevel(logging.INFO)
             LOGGER.addHandler(curses_handler)
 
+            curses.noecho()
+            curses.cbreak()
             stdscr.nodelay(True)  # Don't block for user input.
-            stdscr.resize(26, 140)
+            stdscr.keypad(True)
+            # Sanity check: ensure we got a curses window, not a shadowed name
+            assert hasattr(stdscr, 'addstr'), f"stdscr is not a window (got {type(stdscr)})"
             stdscr.refresh()
-
-            # for debug
-            curses.echo()
 
             try:
                 while not self._exit_check.kill_now:
+                    if not _ensure_min_size(stdscr, 17, 60):
+                        time.sleep(0.2)
+                        continue
                     self._async_tasks.update()
                     self._drive_draw(stdscr, self._lease_keepalive)
 
@@ -199,33 +298,21 @@ class KyeboardSpotManager(object):
     def _drive_draw(self, stdscr, lease_keep_alive):
         """Draw the interface screen at each update."""
         stdscr.clear()  # clear screen
-        stdscr.resize(26, 140)
-        stdscr.addstr(0, 0, f'{self._robot_id.nickname:20s} {self._robot_id.serial_number}')
-        stdscr.addstr(1, 0, self._lease_str(lease_keep_alive))
-        stdscr.addstr(2, 0, self._battery_str())
-        stdscr.addstr(3, 0, self._estop_str())
-        stdscr.addstr(4, 0, self._power_state_str())
-        stdscr.addstr(5, 0, self._time_sync_str())
+        _safe_addstr(stdscr, 0, 0, f'{self._robot_id.nickname:20s} {self._robot_id.serial_number}')
+        _safe_addstr(stdscr, 1, 0, self._lease_str(lease_keep_alive))
+        _safe_addstr(stdscr, 2, 0, self._battery_str())
+        _safe_addstr(stdscr, 3, 0, self._estop_str())
+        _safe_addstr(stdscr, 4, 0, self._power_state_str())
+        _safe_addstr(stdscr, 5, 0, self._time_sync_str())
         for i in range(3):
-            stdscr.addstr(7 + i, 2, self.message(i))
-        stdscr.addstr(10, 0, 'Commands: [TAB]: quit                               ')
-        stdscr.addstr(11, 0, '          [T]: Time-sync, [SPACE]: Estop, [P]: Power')
-        stdscr.addstr(12, 0, '          [I]: Take image, [O]: Video mode          ')
-        stdscr.addstr(13, 0, '          [f]: Stand, [r]: Self-right               ')
-        stdscr.addstr(14, 0, '          [v]: Sit, [b]: Battery-change             ')
-        stdscr.addstr(15, 0, '          [wasd]: Directional strafing              ')
-        stdscr.addstr(16, 0, '          [qe]: Turning, [ESC]: Stop                ')
-        stdscr.addstr(17, 0, '          [l]: Return/Acquire lease                 ')
-        stdscr.addstr(18, 0, '')
-
-        # print as many lines of the image as will fit on the curses screen
-        if self._image_task.ascii_image is not None:
-            max_y, _max_x = stdscr.getmaxyx()
-            for y_i, img_line in enumerate(self._image_task.ascii_image):
-                if y_i + 17 >= max_y:
-                    break
-
-                stdscr.addstr(y_i + 17, 0, img_line)
+            _safe_addstr(stdscr, 7 + i, 2, self.message(i))
+        _safe_addstr(stdscr, 10, 0, 'Commands: [TAB]: quit                                              ')
+        _safe_addstr(stdscr, 11, 0, '          [T]: Time-sync, [SPACE]: Estop, [P]: Power               ')
+        _safe_addstr(stdscr, 12, 0, '          [f]: Stand, [r]: Self-right, [wasd]: Directional strafing')
+        _safe_addstr(stdscr, 13, 0, '          [v]: Sit, [b]: Battery-change, [qe]: Turning             ')
+        _safe_addstr(stdscr, 14, 0, '          [i]: Toggle camera view (OpenCV windows), [ESC]: Stop    ')
+        _safe_addstr(stdscr, 15, 0, '          [o]: Toggle fiducial follow [l]: Return/Acquire lease    ')
+        _safe_addstr(stdscr, 16, 0, '')
 
         stdscr.refresh()
 
@@ -289,6 +376,42 @@ class KyeboardSpotManager(object):
                 self._lease_keepalive.shutdown()
                 self._lease_keepalive = None
 
+    def _toggle_camera_viewer(self):
+        """Start/stop OpenCV camera streaming independently of fiducial follow."""
+        try:
+            self._ensure_fiducial()  # provides image_client + rotate_image
+            if self._viewer is None:
+                self._viewer = DisplayImagesAsync(self._fiducial)  # starts with defaults
+                self._viewer.start()
+                self.add_message("Camera viewer: STARTED")
+            else:
+                self._viewer.stop()
+                self._viewer = None
+                self.add_message("Camera viewer: STOPPED")
+        except Exception as e:
+            self.add_message(f"Viewer error: {e}")
+
+    def _toggle_fiducial_follow(self):
+        """Start/stop fiducial follower in its own thread."""
+        try:
+            self._ensure_fiducial()
+            # Start if not running
+            if self._fid_thread is None or not self._fid_thread.is_alive():
+                self._fid_thread = threading.Thread(target=self._fiducial.start, daemon=True)
+                self._fid_thread.start()
+                self.add_message("Fiducial follow: STARTED")
+            else:
+                # Stop if running
+                self._fiducial.stop()
+                try:
+                    self._fid_thread.join(timeout=2.0)
+                except Exception:
+                    pass
+                self._fid_thread = None
+                self.add_message("Fiducial follow: STOPPED")
+        except Exception as e:
+            self.add_message(f"Fiducial error: {e}")
+
     def _start_robot_command(self, desc, command_proto, end_time_secs=None):
 
         def _start_command():
@@ -313,6 +436,9 @@ class KyeboardSpotManager(object):
     def _stand(self):
         self._start_robot_command('stand', RobotCommandBuilder.synchro_stand_command())
 
+    def _stop(self):
+        self._start_robot_command('stop', RobotCommandBuilder.stop_command())
+
     def _move_forward(self):
         self._velocity_cmd_helper('move_forward', v_x=VELOCITY_BASE_SPEED)
 
@@ -331,19 +457,10 @@ class KyeboardSpotManager(object):
     def _turn_right(self):
         self._velocity_cmd_helper('turn_right', v_rot=-VELOCITY_BASE_ANGULAR)
 
-    def _stop(self):
-        self._start_robot_command('stop', RobotCommandBuilder.stop_command())
-
     def _velocity_cmd_helper(self, desc='', v_x=0.0, v_y=0.0, v_rot=0.0):
         self._start_robot_command(
             desc, RobotCommandBuilder.synchro_velocity_command(v_x=v_x, v_y=v_y, v_rot=v_rot),
             end_time_secs=time.time() + VELOCITY_CMD_DURATION)
-
-    def _stow(self):
-        self._start_robot_command('stow', RobotCommandBuilder.arm_stow_command())
-
-    def _unstow(self):
-        self._start_robot_command('stow', RobotCommandBuilder.arm_ready_command())
 
     def _return_to_origin(self):
         self._start_robot_command(
@@ -352,20 +469,6 @@ class KyeboardSpotManager(object):
                 goal_x=0.0, goal_y=0.0, goal_heading=0.0, frame_name=ODOM_FRAME_NAME, params=None,
                 body_height=0.0, locomotion_hint=spot_command_pb2.HINT_SPEED_SELECT_TROT),
             end_time_secs=time.time() + 20)
-
-    def _take_ascii_image(self):
-        source_name = 'frontright_fisheye_image'
-        image_response = self._image_client.get_image_from_sources([source_name])
-        image = Image.open(io.BytesIO(image_response[0].shot.image.data))
-        ascii_image = self._ascii_converter.convert_to_ascii(image, new_width=70)
-        self._last_image_ascii = ascii_image
-
-    def _toggle_ascii_video(self):
-        if self._video_mode:
-            self._video_mode = False
-        else:
-            self._video_mode = True
-
 
     def _toggle_power(self):
         power_state = self._power_state()
@@ -454,15 +557,32 @@ class KyeboardSpotManager(object):
         battery_state = self.robot_state.battery_states[0]
         status = battery_state.Status.Name(battery_state.status)
         status = status[7:]  # get rid of STATUS_ prefix
-        if battery_state.charge_percentage.value:
-            bar_len = int(battery_state.charge_percentage.value) // 10
-            bat_bar = f'|{"=" * bar_len}{" " * (10 - bar_len)}|'
-        else:
-            bat_bar = ''
+        pct = ''
+        try:
+            if battery_state.HasField('charge_percentage'):
+                pct = f'{battery_state.charge_percentage.value:.0f}'
+        except Exception:
+             # Fallback if HasField isn't available
+            v = getattr(getattr(battery_state, 'charge_percentage', None), 'value', None)
+            if v is not None:
+                pct = f'{v:.0f}'
         time_left = ''
         if battery_state.estimated_runtime:
             time_left = f'({secs_to_hms(battery_state.estimated_runtime.seconds)})'
-        return f'Battery: {status}{bat_bar} {time_left}'
+        return f'Battery: {status} {pct + "%" if pct!= ""else""} {time_left}'.strip()
+    
+    def _fiducial_options(self):
+        # Defaults: use Spot's world-object service so you don't need apriltag installed.
+        return SimpleNamespace(
+            distance_margin=0.15,
+            limit_speed=True,
+            avoid_obstacles=True,
+            use_world_objects=True,
+        )
+
+    def _ensure_fiducial(self):
+        if self._fiducial is None:
+            self._fiducial = FollowFiducial(self._robot, self._fiducial_options())
 
 
 def _setup_logging(verbose):
@@ -473,8 +593,8 @@ def _setup_logging(verbose):
     LOGGER.setLevel(logging.DEBUG)
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    # Save log messages to file wasd.log for later debugging.
-    file_handler = logging.FileHandler('wasd.log')
+    # Save log messages to file spot_control_manager.log for later debugging.
+    file_handler = logging.FileHandler('spot_control_manager.log')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(log_formatter)
     LOGGER.addHandler(file_handler)
@@ -490,5 +610,58 @@ def _setup_logging(verbose):
     stream_handler.setFormatter(log_formatter)
     LOGGER.addHandler(stream_handler)
     return stream_handler
-    
-    
+
+def main():
+    """Command-line interface."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    bosdyn.client.util.add_base_arguments(parser)
+    parser.add_argument('--time-sync-interval-sec',
+                        help='The interval (seconds) that time-sync estimate should be updated.',
+                        type=float)
+    options = parser.parse_args()
+
+    stream_handler = _setup_logging(options.verbose)
+
+    # Create robot object.
+    sdk = create_standard_sdk('SpotManagerClient')
+    robot = sdk.create_robot(options.hostname)
+    try:
+        bosdyn.client.util.authenticate(robot)
+        robot.start_time_sync(options.time_sync_interval_sec)
+    except RpcError as err:
+        LOGGER.error('Failed to communicate with robot: %s', err)
+        return False
+
+    spot_interface = KyeboardSpotManager(robot)
+    try:
+        spot_interface.start()
+    except (ResponseError, RpcError) as err:
+        LOGGER.error('Failed to initialize robot communication: %s', err)
+        return False
+
+    # LOGGER.removeHandler(stream_handler)  # Don't use stream handler in curses mode.
+
+    try:
+        try:
+            # Prevent curses from introducing a 1-second delay for ESC key
+            os.environ.setdefault('ESCDELAY', '0')
+            # Run spot interface in curses mode, then restore terminal config.
+            curses.wrapper(spot_interface.drive)
+        finally:
+            # Restore stream handler to show any exceptions or final messages.
+            # LOGGER.addHandler(stream_handler)
+            pass
+    except Exception as e:
+        LOGGER.exception('Spot Manager has thrown an error: [%r] %s', e, e)
+    finally:
+        # Do any final cleanup steps.
+        spot_interface.shutdown()
+
+    return True
+
+
+if __name__ == '__main__':
+    if not main():
+        sys.exit(1)
