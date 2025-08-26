@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from sys import platform
+import winsound
 
 import cv2
 import numpy as np
@@ -34,7 +35,6 @@ from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient,
 from bosdyn.client.robot_id import RobotIdClient, version_tuple
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.world_object import WorldObjectClient
-from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
 
 #pylint: disable=no-member
 LOGGER = logging.getLogger()
@@ -56,12 +56,6 @@ class FollowFiducial(object):
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._world_object_client = robot.ensure_client(WorldObjectClient.default_service_name)
-
-        # Target selection / stickiness
-        self._current_target_id = None
-        self._lost_target_ticks = 0
-        self._lost_target_patience = 8  # how many cycles we tolerate before dropping target
-
 
         # Stopping Distance (x,y) offset from the tag and angle offset from desired angle.
         self._tag_offset = float(options.distance_margin) + BODY_LENGTH / 2.0  # meters
@@ -141,7 +135,6 @@ class FollowFiducial(object):
             self._stop.clear()
         self._movement_on = True
         self._attempts = 0
-        
         # Stand the robot up.
         if self._standup:
             self.power_on()
@@ -161,6 +154,7 @@ class FollowFiducial(object):
                 # Pick tag 5 if it's in view
                 target = next((f for f in fiducials if f.apriltag_properties.tag_id == 5), None)
                 if target is not None:
+                    winsound.PlaySound("SPOT following.wav", winsound.SND_FILENAME)
                     tf = get_a_tform_b(
                         target.transforms_snapshot,
                         VISION_FRAME_NAME,
@@ -172,6 +166,8 @@ class FollowFiducial(object):
                         self.go_to_tag(pos)
                     else:
                         LOGGER.info("Tag 5 detected but transform not available yet")
+                else:
+                    LOGGER.info("enter the fiducial ID for the SPOT to follow")
             else:
                 LOGGER.info("No fiducials found")
 
