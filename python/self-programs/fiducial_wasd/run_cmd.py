@@ -5,7 +5,7 @@ import subprocess
 
 # Configuration
 program_directory = os.path.dirname(os.path.abspath(__file__))
-program_name = "fiducial_wasd.py"
+program_name = "spot_control_manager.py"
 robot_ip = "192.168.80.3"
 
 # Change to the directory where the program is located
