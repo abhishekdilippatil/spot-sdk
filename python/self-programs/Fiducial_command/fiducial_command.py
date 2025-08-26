@@ -73,9 +73,13 @@ class StatusPrinter:
         with self._lock:
             print((msg or "").ljust(self._width), end='\r', flush=True)
 
-    def clear(self):
-        with self._lock:
-            print(' ' * self._width, end='\r', flush=True)
+logging.basicConfig(level=logging.INFO)
+
+LOGGER = logging.getLogger()
+#for wasd
+VELOCITY_BASE_SPEED   = 0.5   # m/s
+VELOCITY_BASE_ANGULAR = 0.8   # rad/s
+VELOCITY_CMD_DURATION = 0.6   # seconds
 
     def note(self, msg: str):
         """Print a one-off message on a new line, clearing the status row first."""
@@ -96,8 +100,16 @@ class FollowFiducial(object):
         self.mode = 'manual'
 
         self._robot = robot
-        self._tag_detector = apriltag(families='tag36h11')
-        self._robot_id = robot.ensure_client(RobotIdClient.default_service_name).get_id(timeout=0.4)
+        self._accept_manual_input = False
+
+        self._tag_detector = apriltag(families='tag36h11',
+                            nthreads=os.cpu_count() or 4,
+                            quad_decimate=2.0,  # try 2.0 first; reduce if tags are small
+                            refine_edges=1)
+        self._tag_not_located = False
+        self._intrinsics_cache = {}
+        self._cam_tform_body_cache = {}
+        self._robot_id = robot.ensure_client(RobotIdClient.default_service_name).get_id(timeout=3.0)
         self._power_client = robot.ensure_client(PowerClient.default_service_name)
         self._image_client = robot.ensure_client(ImageClient.default_service_name)
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
@@ -181,11 +193,17 @@ class FollowFiducial(object):
             self._detection_thread.join(timeout=1.0)
 
     def start(self):
-        self._robot.time_sync.wait_for_sync()
+        """Claim lease of robot and start the AprilTag follower."""
+        self._robot.time_sync.wait_for_sync(timeout_sec=8.0)
+        # Stand the robot up.
         if self._standup:
             self.power_on()
-            blocking_stand(self._robot_command_client)
+            blocking_stand(self._robot_command_client, timeout_sec=10)
+
+            # Delay grabbing image until spot is standing (or close enough to upright).
             time.sleep(.35)
+            self._accept_manual_input = True
+
 
         self.start_detection_thread()
         try:
@@ -201,13 +219,15 @@ class FollowFiducial(object):
         self._running = False
 
     def power_on(self):
-        self._robot.power_on()
+        """Power on the robot."""
+        self._robot.power_on(timeout_sec=10)
         self._powered_on = True
         status.note(f'Powered On {self._robot.is_powered_on()}')
 
     def power_off(self):
-        self._robot.power_off()
-        status.note(f'Powered Off {not self._robot.is_powered_on()}')
+        """Power off the robot."""
+        self._robot.power_off(cut_immediately=False, timeout_sec=20.0)
+        print(f'Powered Off {not self._robot.is_powered_on()}')
 
     # -------------------- Motion helpers --------------------
 
@@ -225,14 +245,10 @@ class FollowFiducial(object):
             body_height=0.0,
             locomotion_hint=spot_command_pb2.HINT_AUTO,
         )
-        try:
-            self._robot_command_client.robot_command(command=vel_cmd, end_time_secs=time.time() + duration)
-            time.sleep(duration)
-        finally:
-            try:
-                self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
-            except bosdyn.client.robot_command.ExpiredError:
-                pass
+        
+        self._robot_command_client.robot_command(command=vel_cmd, end_time_secs=time.time() + duration, timeout=3.0)
+            
+        
 
     def rotate_in_place(self, angle_rad, angular_speed=0.5):
         """Rotate body yaw by angle_rad (positive=CCW) at angular_speed."""
@@ -293,9 +309,11 @@ class FollowFiducial(object):
     def _announce_tag_prompt(self, infos):
         ids = [i['id'] for i in infos]
         closest = min(infos, key=lambda x: x['dist'])
-        status.note(f"\n[AprilTag] Detected IDs: {ids}\n"
-                    f"Closest: ID={closest['id']} at ~{closest['dist']:.2f} m.\n"
-                    f"Press [F] to FOLLOW closest, or [C] to CONTINUE manual driving.")
+        print("\n[AprilTag] Detected IDs:", ids)
+        print(f"Closest: ID={closest['id']} at ~{closest['dist']:.2f} m.")
+        print("Press [F] to FOLLOW closest, or [C] to CONTINUE manual driving, or [M] for prompt menu.")
+        # brief pause to avoid flicker/re-announce
+        self._suppress_prompt_until = time.time() + 0.25
 
     def _pnp_each(self, bboxes, tag_ids):
         out = []
@@ -368,51 +386,255 @@ class FollowFiducial(object):
             self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
         finally:
             self.mode = 'manual'
-            status.note("Follow cancelled. Manual mode.")
+            self._suppress_prompt_until = time.time() + self._prompt_cooldown_s
+            print("Follow cancelled. Manual mode.")
 
-    # -------------------- Image capture + detection --------------------
+
+    def prompt_next_action(self):
+        """Blocking version (used after reaching a tag)."""
+        print("\nSpot has reached the tag.")
+        return self.menu_read_blocking()
+
+    def show_hot_menu(self):
+        print("\nWhat should Spot do next?")
+        print("  [p] Take photo from all cameras and save")
+        print("  [n] Find another tag and follow")
+        print("  [r] Rotate 90 degrees and search")
+        print("  [h] Hold position (stay here)")
+        print("  [z] Quit")
+
+    def menu_read_blocking(self):
+        """Blocking read for menu (used after following)."""
+        self.show_hot_menu()
+        while True:
+            action = input("Enter your choice [n/q/r/h/p]: ").strip().lower()
+            if action in ["n", "z", "r", "h", "p"]:
+                if action == "p":
+                    self.capture_and_save_photos_from_all_cameras()
+                    self.show_hot_menu()
+                    continue
+                return action
+            else:
+                print("Invalid input. Please enter one of: n, q, r, h, p.")
+
+    def hold_position(self):
+        """Stop and hold position."""
+        try:
+            self._robot_command_client.robot_command(command=RobotCommandBuilder.stop_command())
+        except Exception:
+            pass
+        self.mode = 'manual'
+        print("Holding position.")
+
+    def handle_menu_choice(self, key):
+        k = key.lower()
+        if k == 'p':
+            self.capture_and_save_photos_from_all_cameras()
+        elif k == 'n':
+            print("Searching for new tags.")
+            self._previous_source = None
+            self.mode = 'search'
+        elif k == 'r':
+            print("Rotating 90 degrees and scanning.")
+            self._previous_source = None
+            self.sweep_yaw()
+        elif k == 'h':
+            self.hold_position()
+        elif k == 'z':
+            print("Quitting as requested by user.")
+            self._attempts = self._max_attempts + 1  # exit main loop
+        else:
+            print("Invalid choice. Use [n/z/r/h/p].")
+
+
+    def prompt_follow_or_rotate(self, tag_ids):
+        """Ask whether to follow a visible tag or rotate to search for another."""
+        while True:
+            choice = input("\nDetected tags. Follow a tag [f] or rotate 90° to find another [r]? ").strip().lower()
+            if choice == 'f':
+                # If there's only one tag, follow it. Otherwise ask which ID.
+                if len(tag_ids) == 1:
+                    return ("follow", tag_ids[0])
+                else:
+                    while True:
+                        try:
+                            user_input = input(f"Enter the ID of the tag to follow from {tag_ids}: ").strip()
+                            chosen_tag_id = int(user_input)
+                            if chosen_tag_id in tag_ids:
+                                return ("follow", chosen_tag_id)
+                            print(f"Tag ID {chosen_tag_id} is not in {tag_ids}. Try again.")
+                        except Exception:
+                            print("Invalid input. Please enter a valid numeric tag ID.")
+            elif choice == 'r':
+                return ("rotate", None)
+            else:
+                print("Please enter 'f' to follow or 'r' to rotate.")
+
+    def print_detected_tags_with_distance(self, bboxes, tag_ids):
+        """Compute and print distances for currently detected tags."""
+        camera = self.make_camera_matrix(self._intrinsics)
+        print("\nDetected AprilTags in view:")
+        for idx, tag_id in enumerate(tag_ids):
+            obj_points, img_points = self.bbox_to_image_object_pts(bboxes[idx])
+            _, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera, np.zeros((5, 1)))
+            dist_m = math.sqrt(float(tvec[0][0])**2 + float(tvec[1][0])**2 + float(tvec[2][0])**2) / 1000.0
+            print(f"  Tag {idx+1}: ID={tag_id}, Distance={dist_m:.2f} m")
+
+
+    def rotate_in_place(self, angle_rad=math.pi/2, angular_speed=1): # angle_rad in radians, angle can be changed by changing pi/2
+        """Rotate in place."""
+        print(f" Rotating {round(math.degrees(angle_rad))} degrees to scan...")
+        mobility_params = self.set_mobility_params()
+        spin_cmd = RobotCommandBuilder.synchro_velocity_command(
+            v_x=0.0,
+            v_y=0.0,
+            v_rot=angular_speed if angle_rad >= 0 else -angular_speed,
+            frame_name=BODY_FRAME_NAME,
+            params=mobility_params,
+            body_height=0.0,
+            locomotion_hint=spot_command_pb2.HINT_AUTO
+        )
+        if self._movement_on and self._powered_on:
+            duration = abs(angle_rad / angular_speed)
+            self._robot_command_client.robot_command(
+                lease=None, command=spin_cmd, end_time_secs=time.time() + duration, timeout=5.0
+            )
+            time.sleep(duration)
+            time.sleep(1)
+            stop_cmd = RobotCommandBuilder.stop_command()
+            try:
+                self._robot_command_client.robot_command(lease=None, command=stop_cmd, timeout=3.0)
+            except bosdyn.client.robot_command.ExpiredError as e:
+                print(" Spot reports stop command expired. (Usually safe to ignore)", e)
+
+    def sweep_yaw(self, yaw_range=math.radians(90), steps=9, pause=1.0):
+        """Sweep Spot's body yaw left and right to look for AprilTags."""
+        self._previous_source = None # Next image will not pass to last camera source
+        max_yaw = yaw_range / 2
+        yaws = np.linspace(-max_yaw, max_yaw, steps)
+        for yaw in yaws:
+            orientation = EulerZXY(yaw, 0.0, 0.0)
+            stand_cmd = RobotCommandBuilder.synchro_stand_command(body_height=0.0, footprint_R_body=orientation)
+            self._robot_command_client.robot_command(lease=None, command=stand_cmd, end_time_secs=time.time() + pause)
+            time.sleep(pause)
+            self._last_chosen_tag_id = None
+            self._last_detected_tag_ids = []
+    
+    def capture_and_save_photos_from_all_cameras(self):
+        """
+        Prompts the user to capture a photo from all cameras and asks where to save.
+        """
+        print("\n Capture photos from all cameras")
+        input("Press Enter to take photos from all cameras...")
+
+        images = {}
+        for source_name in self._source_names:
+            print(f" Capturing image from {source_name}...")
+            img_req = build_image_request(source_name, quality_percent=100,
+                                        image_format=image_pb2.Image.FORMAT_RAW)
+            image_response = self._image_client.get_image([img_req], timeout=10.0)
+            width = image_response[0].shot.image.cols
+            height = image_response[0].shot.image.rows
+
+            # Convert raw bytes to 8-bit greyscale numpy array
+            image_grey = np.array(
+                Image.frombytes('P', (int(width), int(height)),
+                                data=image_response[0].shot.image.data, decoder_name='raw'))
+
+            image_grey = self.rotate_image(image_grey, source_name)
+            images[source_name] = image_grey
+
+        # Ask user for directory
+        save_dir = input("\nEnter the directory path to save images (will be created if it doesn't exist): ").strip()
+        if not save_dir:
+            save_dir = os.getcwd()
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # Save all images
+        for source_name, image in images.items():
+            out_path = os.path.join(save_dir, f"{source_name}.png")
+            cv2.imwrite(out_path, image)
+            print(f" Saved {source_name} to {out_path}")
+        print(" All images saved!\n")
 
     def image_to_bounding_box(self):
-        # Prefer last source; otherwise round-robin through all sources
-        for i in range(len(self._source_names) + 1):
-            if i == 0:
-                if self._previous_source is not None:
-                    source_name = self._previous_source
-                else:
-                    continue
-            elif self._source_names[i - 1] == self._previous_source:
-                continue
-            else:
-                source_name = self._source_names[i - 1]
-            try:
-                img_req = build_image_request(source_name, quality_percent=100,
-                                              image_format=image_pb2.Image.FORMAT_RAW)
-                image_response = self._image_client.get_image([img_req])
-                shot = image_response[0].shot
-                src = image_response[0].source
+        """Determine which camera source has a AprilTag..
+           Return the bounding box of the first detected AprilTag."""
+        # Build requests:
+        reqs = []
+        scan_sources = [self._previous_source] if self._previous_source else []
+        if not scan_sources:
+            scan_sources = self._source_names if (self._attempts % 10 == 0) else [self._source_names[0]]
 
-                # Transforms
-                self._camera_tform_body = get_a_tform_b(shot.transforms_snapshot,
-                                                        shot.frame_name_image_sensor,
-                                                        BODY_FRAME_NAME)
-                self._body_tform_world = get_a_tform_b(shot.transforms_snapshot,
-                                                       BODY_FRAME_NAME, VISION_FRAME_NAME)
-                # Intrinsics & (optional) distortion
-                self._intrinsics = src.pinhole.intrinsics
-                self._dist_coeffs = self._get_distortion_coeffs_safe(src)
+        for src in scan_sources:
+            reqs.append(build_image_request(src, quality_percent=80,
+                                    image_format=image_pb2.Image.FORMAT_JPEG))
 
-                w, h = shot.image.cols, shot.image.rows
-                expected = int(w) * int(h)
-                if len(shot.image.data) != expected:
-                    # Unexpected buffer size — skip frame (common if stream hiccups)
-                    raise ValueError(f"buffer={len(shot.image.data)} != w*h={expected}")
+        responses = self._image_client.get_image(reqs, timeout=3.0)
+        for resp in responses:
+            src = resp.source.name
+            # cache intrinsics once per source
+            if src not in self._intrinsics_cache:
+                self._intrinsics_cache[src] = resp.source.pinhole.intrinsics
+            # camera->body is static; compute once
+            if src not in self._cam_tform_body_cache:
+                self._cam_tform_body_cache[src] = get_a_tform_b(resp.shot.transforms_snapshot,
+                                                                resp.shot.frame_name_image_sensor,
+                                                                BODY_FRAME_NAME)
+            self._camera_tform_body = self._cam_tform_body_cache[src]
+            self._body_tform_world  = get_a_tform_b(resp.shot.transforms_snapshot, BODY_FRAME_NAME, VISION_FRAME_NAME)
 
-                bboxes, tag_ids = self.detect_fiducial_in_image(shot.image, (w, h), source_name)
-                if bboxes:
-                    return bboxes, tag_ids, source_name
-            except Exception as e:
-                status.update(f"Detect({source_name}): {type(e).__name__} {e}")
+            # Decode JPEG
+            data = np.frombuffer(resp.shot.image.data, dtype=np.uint8)
+            image_gray = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+            image_gray = self.rotate_image(image_gray, src)
+
+            bboxes, tag_ids = self.detect_fiducial_in_image_array(image_gray, src)  # new helper using pregray
+            if bboxes:
+                self._intrinsics = self._intrinsics_cache[src]
+                return bboxes, tag_ids, src
+
+        # only log once per cycle:
+        if self._tag_not_located:
+            self._tag_not_located = False
+            print("\rNo AprilTags found in current scan.", end="", flush=True)
         return [], [], None
+
+    def detect_fiducial_in_image_array(self, image_gray, source_name):
+        """
+        Run AprilTag detection on a grayscale image (already rotated upright).
+        Returns (bboxes, tag_ids), where bboxes is a list of 4x2 float32 arrays
+        in the ORIGINAL image coordinates.
+        """
+        # Downscale for speed, then map corners back to full-res
+        # (adjust scale if your tags are tiny/far)
+        scale = 0.6
+        if image_gray is None or image_gray.size == 0:
+            return [], []
+
+        det_img = cv2.resize(image_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        detections = self._tag_detector.detect(det_img)
+
+        bboxes, tag_ids = [], []
+        if detections:
+            inv_scale = 1.0 / scale
+            for det in detections:
+                # det.corners is 4x2 in the scaled image
+                bbox = (np.array(det.corners, dtype=np.float32) * inv_scale)
+                bboxes.append(bbox)
+                tag_ids.append(int(det.tag_id))
+
+            # For preview only (don’t draw on the processing image)
+            preview = image_gray.copy()
+            for bb in bboxes:
+                cv2.polylines(preview, [np.int32(bb)], True, (0, 0, 0), 2)
+            self._image[source_name] = preview
+        else:
+            # Cache the raw image for display even if no detections
+            self._image[source_name] = image_gray
+
+        return bboxes, tag_ids
 
     def detect_fiducial_in_image(self, image, dim, source_name):
         try:
@@ -462,9 +684,13 @@ class FollowFiducial(object):
             body_height=0.0, locomotion_hint=spot_command_pb2.HINT_AUTO)
         end_time = 30.0
         if self._movement_on and self._powered_on:
-            self._robot_command_client.robot_command(command=tag_cmd, end_time_secs=time.time() + end_time)
-            start = time.time()
-            while (self.mode == 'following') and (not self.final_state()) and ((time.time() - start) < end_time):
+            #Issue the command to the robot
+            self._robot_command_client.robot_command(lease=None, command=tag_cmd,
+                                                     end_time_secs=time.time() + end_time, timeout=10.0)
+            #Feedback to check and wait until the robot is in the desired position or timeout
+            start_time = time.time()
+            current_time = time.time()
+            while (not self.final_state() and current_time - start_time < end_time):
                 time.sleep(.25)
 
     def final_state(self):
@@ -583,6 +809,7 @@ class KeyboardController(threading.Thread):
         super().__init__(daemon=True)
         self.f = follower
         self._stop = False
+        self._menu_armed = False
         if not _WIN:
             self._fd = sys.stdin.fileno()
             self._old = termios.tcgetattr(self._fd)
@@ -613,6 +840,18 @@ class KeyboardController(threading.Thread):
                     self.f.stop()
                     self.stop()
                     continue
+
+                # Menu hotkey: press 'm' to show, next key is the choice
+                if ch.lower() == 'm':
+                    self.f.show_hot_menu()
+                    self._menu_armed = True
+                    continue
+                if self._menu_armed:
+                    self._menu_armed = False
+                    self.f.handle_menu_choice(ch)
+                    continue
+
+                # If we're prompting: [F] follow, [C] continue
                 if self.f.mode == 'prompt':
                     if ch.lower() == 'f':
                         self.f.follow_detected_closest()
