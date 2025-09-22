@@ -1,65 +1,44 @@
-```mermaid
 flowchart LR
-%% Layout direction
-%% LR = left-to-right for wide reports
-
 
 subgraph OP[Operator & Client System]
-UI[Operator UI\n(Keyboard / X‑Box / GUI)]
-CLIENT[Client System\n(Task Console & Data Viewer)]
+  UI[Operator UI<br/>(Keyboard / Xbox / GUI)]
+  CLIENT[Client System<br/>(Task Console & Viewer)]
 end
 
-
-NET[(Wi‑Fi / Ethernet)]
-
+NET[(Wi-Fi / Ethernet)]
 
 subgraph SPOT[SPOT Robot]
-direction TB
-subgraph SENS[Perception]
-CAMS[Cameras\n(Fisheye + Depth)]
-IMG[Image Service]
+  direction TB
+
+  subgraph SENS[Perception]
+    CAMS[Cameras<br/>(Fisheye + Depth)]
+    IMG[Image Service]
+  end
+
+  subgraph CTRL[Control & Autonomy]
+    TAG[AprilTag / Fiducial Detection]
+    AUTO[Autonomy<br/>(GraphNav / Navigation)]
+    TASK[Task Manager<br/>(Image capture, move,<br/>send digital signal)]
+    MAN[Manual Override Module]
+    MOT[Motion Control<br/>(Robot Command)]
+    SAFE[Safety<br/>(E-Stop, Lease, Auth)]
+  end
+
+  LOG[Data Logger]
+  TELE[Telemetry / Status]
 end
 
-
-subgraph CTRL[Control & Autonomy]
-TAG[AprilTag / Fiducial Detection]
-AUTO[Autonomy\n(GraphNav / Navigation)]
-TASK[Task Manager\n(Image capture, move,\nsend digital signal)]
-MAN[Manual Override Module]
-MOT[Motion Control\n(Robot Command)]
-SAFE[Safety\n(E‑Stop, Lease, Auth)]
-end
-
-
-LOG[Data Logger]
-end
-
-
-STORE[(Optional: Storage / BIM / Server)]
-
+STORE[(Storage / BIM Server)]
 
 %% Connections
-UI -->|Teleop commands| NET -->|RPC (gRPC)| MAN
-UI -- Feedback (status, video) --> CLIENT
+UI -->|Teleop commands| NET
 CLIENT <-->|RPC / APIs| NET
-NET --> SPOT
+NET -->|gRPC| MAN
+NET -->|gRPC| AUTO
 
-
-CAMS --> IMG --> TAG
-TAG --> AUTO
-AUTO --> TASK
+CAMS --> IMG --> TAG --> AUTO --> TASK --> MOT
 MAN --> MOT
-AUTO --> MOT
 SAFE -. supervises .-> MOT
 
-
-%% Outputs / telemetry
-TASK -->|Images / Signals| LOG
-LOG -->|Uploads| STORE
-SPOT -->|State, health| CLIENT
-
-
-%% Notes
-classDef dim fill:#f8f9fa,stroke:#c8c8c8,color:#111;
-classDef strong fill:#e8f5e9,stroke:#29b06f,color:#0b4127;
-class SENS,CTRL,strong
+TASK -->|Images / Signals| LOG --> STORE
+TELE --> CLIENT
