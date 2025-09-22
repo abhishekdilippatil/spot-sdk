@@ -1,45 +1,37 @@
 ```mermaid
 flowchart LR
 
-subgraph OP[Operator & Client System]
-  UI[Operator UI<br/>(Keyboard / Xbox / GUI)]
-  CLIENT[Client System<br/>(Task Console & Viewer)]
+subgraph "Operator and Client System"
+  UI[Operator UI]
+  CLIENT[Client System]
 end
 
-NET[(Wi-Fi / Ethernet)]
+NET[WiFi or Ethernet]
 
-subgraph SPOT[SPOT Robot]
+subgraph "SPOT Robot"
   direction TB
-
-  subgraph SENS[Perception]
-    CAMS[Cameras<br/>(Fisheye + Depth)]
-    IMG[Image Service]
-  end
-
-  subgraph CTRL[Control & Autonomy]
-    TAG[AprilTag / Fiducial Detection]
-    AUTO[Autonomy<br/>(GraphNav / Navigation)]
-    TASK[Task Manager<br/>(Image capture, move,<br/>send digital signal)]
-    MAN[Manual Override Module]
-    MOT[Motion Control<br/>(Robot Command)]
-    SAFE[Safety<br/>(E-Stop, Lease, Auth)]
-  end
-
-  LOG[Data Logger]
-  TELE[Telemetry / Status]
+  CAMS[Cameras]
+  IMG[Image service]
+  TAG[Fiducial detection]
+  AUTO[Autonomy]
+  TASK[Task manager]
+  MAN[Manual override]
+  MOT[Motion control]
+  SAFE[Safety]
+  LOG[Data logger]
+  TELE[Telemetry]
 end
 
-STORE[(Storage / BIM Server)]
+STORE[Storage or BIM server]
 
-%% Connections
-UI -->|Teleop commands| NET
-CLIENT <-->|RPC / APIs| NET
-NET -->|gRPC| MAN
-NET -->|gRPC| AUTO
+UI --> NET
+CLIENT <--> NET
+NET --> MAN
+NET --> AUTO
 
 CAMS --> IMG --> TAG --> AUTO --> TASK --> MOT
 MAN --> MOT
-SAFE -. supervises .-> MOT
+SAFE --> MOT
 
-TASK -->|Images / Signals| LOG --> STORE
+TASK --> LOG --> STORE
 TELE --> CLIENT
