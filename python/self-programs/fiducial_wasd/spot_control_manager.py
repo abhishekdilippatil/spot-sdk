@@ -45,7 +45,7 @@ VELOCITY_CMD_DURATION = 0.6  # seconds
 COMMAND_INPUT_RATE = 0.1
 
 #pylint: disable=no-member
-LOGGER = logging.getLogger()
+LOGGER = logging.getLogger("spot_control_manager")
 
 def _safe_addstr(win, y, x, s):
     """Write string safely within window bounds, clipping if needed."""
@@ -180,7 +180,10 @@ class KyeboardSpotManager(object):
             ord('e'): self._turn_right,
             ord('l'): self._toggle_lease,
             ord('i'): self._toggle_camera_viewer,  # start/stop camera streaming
-            ord('o'): self._toggle_fiducial_follow
+            ord('o'): self._toggle_fiducial_follow,
+            ord('m'): self._next_fiducial,
+            ord('n'): self._previous_fiducial,
+            ord('x'): self._toggle_follow_selected,
         }
         self._locked_messages = ['', '', '']  # string: displayed message for user
         self._estop_keepalive = None
@@ -312,8 +315,11 @@ class KyeboardSpotManager(object):
         _safe_addstr(stdscr, 13, 0, '          [v]: Sit, [b]: Battery-change, [qe]: Turning             ')
         _safe_addstr(stdscr, 14, 0, '          [i]: Toggle camera view (OpenCV windows), [ESC]: Stop    ')
         _safe_addstr(stdscr, 15, 0, '          [o]: Toggle fiducial follow [l]: Return/Acquire lease    ')
-        _safe_addstr(stdscr, 16, 0, '')
-
+        _safe_addstr(stdscr, 16, 0, '          [m]: Next fiducial code [n]: Previous fiducial code      ')
+        _safe_addstr(stdscr, 17, 0, '          [x]: toggle follow current fiducial ID                   ')
+        
+        self._draw_fiducial_panel(stdscr, row=18, col=0)
+        
         stdscr.refresh()
 
     def _drive_cmd(self, key):
@@ -579,6 +585,54 @@ class KyeboardSpotManager(object):
             avoid_obstacles=True,
             use_world_objects=True,
         )
+    
+    def _next_fiducial(self):
+        """Cycle selection to the next visible fiducial ID."""
+        self._ensure_fiducial()
+        if not self._fiducial.get_visible_tag_ids():
+            self.add_message("No fiducials visible")
+            return
+        self._fiducial.cycle_selected(+1)
+        self.add_message(f"Selected fiducial: {self._fiducial.selected_tag_id}")
+
+    def _previous_fiducial(self):
+        """Cycle selection to the previous visible fiducial ID."""
+        self._ensure_fiducial()
+        if not self._fiducial.get_visible_tag_ids():
+            self.add_message("No fiducials visible")
+            return
+        self._fiducial.cycle_selected(-1)
+        self.add_message(f"Selected fiducial: {self._fiducial.selected_tag_id}")
+
+    def _toggle_follow_selected(self):
+        """Toggle follow-selected mode on the follower."""
+        self._ensure_fiducial()
+        state = self._fiducial.toggle_follow_selected()
+        status = "ON" if state else "OFF"
+        self.add_message(f"Follow selected: {status}")
+        if not state:
+           self._fiducial.cancel_motion_now()
+
+    def _draw_fiducial_panel(self, stdscr, row=18, col=0):
+        """Render visible IDs, selection, and mode info."""
+        if getattr(self, "_fiducial", None) is None:
+            _safe_addstr(stdscr, row + 0, col, "Fiducials: (follower not started)")
+            return
+
+        # Visible IDs
+        visible = self._fiducial.get_visible_tag_ids()
+        _safe_addstr(stdscr, row + 0, col, f"Fiducials visible: {visible if visible else '[]'}")
+
+        # Selection + mode
+        sel = self._fiducial.selected_tag_id
+        follow_only = "ON" if self._fiducial.follow_selected_only else "OFF"
+        _safe_addstr(stdscr, row + 1, col, f"Selected: {sel if sel is not None else '-'}   Follow selected: {follow_only}")
+
+        # Thread state & master priority note
+        running = (self._fid_thread is not None and self._fid_thread.is_alive())
+        _safe_addstr(stdscr, row + 2, col, f"Fiducial follow thread: {'RUNNING' if running else 'STOPPED'}")
+        _safe_addstr(stdscr, row + 3, col, "Priority: Tag 5 overrides any selection when visible.")
+
 
     def _ensure_fiducial(self):
         if self._fiducial is None:
@@ -591,6 +645,7 @@ def _setup_logging(verbose):
     Returns the stream/console logger so that it can be removed when in curses mode.
     """
     LOGGER.setLevel(logging.DEBUG)
+    LOGGER.propagate = False 
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
     # Save log messages to file spot_control_manager.log for later debugging.
@@ -641,7 +696,9 @@ def main():
         LOGGER.error('Failed to initialize robot communication: %s', err)
         return False
 
-    # LOGGER.removeHandler(stream_handler)  # Don't use stream handler in curses mode.
+
+    if stream_handler in LOGGER.handlers:
+        LOGGER.removeHandler(stream_handler)
 
     try:
         try:
@@ -651,7 +708,8 @@ def main():
             curses.wrapper(spot_interface.drive)
         finally:
             # Restore stream handler to show any exceptions or final messages.
-            # LOGGER.addHandler(stream_handler)
+            if stream_handler not in LOGGER.handlers:
+                LOGGER.addHandler(stream_handler)
             pass
     except Exception as e:
         LOGGER.exception('Spot Manager has thrown an error: [%r] %s', e, e)
