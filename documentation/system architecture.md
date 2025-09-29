@@ -1,8 +1,8 @@
 ```mermaid
 flowchart TD
-  A[run_program.py launcher] --> B[basic_program.py Spot control UI]
-  B --> C[KyeboardSpotManager spot_control_manager.py]
-  C --> D[FollowFiducial fiducial_follow.py]
+  A[run_program.py launcher] --> B[spot_control_manager.py main UI]
+  B --> C[KyeboardSpotManager]
+  B --> D[FollowFiducial fiducial_follow.py]
   D --> E[DisplayImagesAsync]
 
   subgraph SDK_Clients
@@ -16,12 +16,12 @@ flowchart TD
     ES[EstopClient]
   end
 
-  C --> RC
-  C --> RS
-  C --> PW
-  C --> LS
-  C --> TS
-  C --> ES
+  B --> RC
+  B --> RS
+  B --> PW
+  B --> LS
+  B --> TS
+  B --> ES
 
   D --> RC
   D --> RS
