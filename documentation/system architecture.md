@@ -1,37 +1,43 @@
 ```mermaid
-flowchart LR
+flowchart TD
+  A[run_program.py launcher] --> B[basic_program.py Spot control UI]
+  B --> C[KyeboardSpotManager spot_control_manager.py]
+  C --> D[FollowFiducial fiducial_follow.py]
+  D --> E[DisplayImagesAsync]
 
-subgraph "Operator and Client System"
-  UI[Operator UI]
-  CLIENT[Client System]
-end
+  subgraph SDK_Clients
+    RC[RobotCommandClient]
+    RS[RobotStateClient]
+    IM[ImageClient]
+    WO[WorldObjectClient]
+    PW[PowerClient]
+    LS[LeaseClient]
+    TS[TimeSync]
+    ES[EstopClient]
+  end
 
-NET[WiFi or Ethernet]
+  C --> RC
+  C --> RS
+  C --> PW
+  C --> LS
+  C --> TS
+  C --> ES
 
-subgraph "SPOT Robot"
-  direction TB
-  CAMS[Cameras]
-  IMG[Image service]
-  TAG[Fiducial detection]
-  AUTO[Autonomy]
-  TASK[Task manager]
-  MAN[Manual override]
-  MOT[Motion control]
-  SAFE[Safety]
-  LOG[Data logger]
-  TELE[Telemetry]
-end
+  D --> RC
+  D --> RS
+  D --> IM
+  D --> WO
+  D --> PW
 
-STORE[Storage or BIM server]
+  subgraph Spot_Robot
+    R[Spot robot services]
+  end
 
-UI --> NET
-CLIENT <--> NET
-NET --> MAN
-NET --> AUTO
-
-CAMS --> IMG --> TAG --> AUTO --> TASK --> MOT
-MAN --> MOT
-SAFE --> MOT
-
-TASK --> LOG --> STORE
-TELE --> CLIENT
+  RC --> R
+  RS --> R
+  IM --> R
+  WO --> R
+  PW --> R
+  LS --> R
+  TS --> R
+  ES --> R
