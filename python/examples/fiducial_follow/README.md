@@ -47,7 +47,7 @@ This example is not supported on Windows OS if you want to use the external apri
 ## Running the Example
 
 
-python3 fiducial_command.py ROBOT_IP --use-world-objects false --show-preview
+python3 fiducial.py ROBOT_IP --use-world-objects false --show-preview
 
 ### E-Stop Endpoint Dependency
 

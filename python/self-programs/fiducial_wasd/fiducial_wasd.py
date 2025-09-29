@@ -426,10 +426,10 @@ class FollowFiducial(object):
 
     def set_mobility_params(self):
         """Set robot mobility params to disable obstacle avoidance."""
-        obstacles = spot_command_pb2.ObstacleParams(disable_vision_body_obstacle_avoidance=False,   #default is True
-                                                    disable_vision_foot_obstacle_avoidance=False,   #default is True
-                                                    disable_vision_foot_constraint_avoidance=False, #default is True
-                                                    obstacle_avoidance_padding=.010)    # default is .001
+        obstacles = spot_command_pb2.ObstacleParams(disable_vision_body_obstacle_avoidance=True,
+                                                    disable_vision_foot_obstacle_avoidance=True,
+                                                    disable_vision_foot_constraint_avoidance=True,
+                                                    obstacle_avoidance_padding=.001)
         body_control = self.set_default_body_control()
         if self._limit_speed:
             speed_limit = SE2VelocityLimit(max_vel=SE2Velocity(

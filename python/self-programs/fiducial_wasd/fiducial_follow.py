@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from sys import platform
+import winsound
 
 import cv2
 import numpy as np
@@ -34,10 +35,9 @@ from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient,
 from bosdyn.client.robot_id import RobotIdClient, version_tuple
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.world_object import WorldObjectClient
-from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
 
 #pylint: disable=no-member
-LOGGER = logging.getLogger()
+LOGGER = logging.getLogger("fiducial_follow")
 
 # Use this length to make sure we're commanding the head of the robot
 # to a position instead of the center.
@@ -56,12 +56,6 @@ class FollowFiducial(object):
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._world_object_client = robot.ensure_client(WorldObjectClient.default_service_name)
-
-        # Target selection / stickiness
-        self._current_target_id = None
-        self._lost_target_ticks = 0
-        self._lost_target_patience = 8  # how many cycles we tolerate before dropping target
-
 
         # Stopping Distance (x,y) offset from the tag and angle offset from desired angle.
         self._tag_offset = float(options.distance_margin) + BODY_LENGTH / 2.0  # meters
@@ -82,6 +76,12 @@ class FollowFiducial(object):
         self._movement_on = True  # Let the robot walk towards the fiducial.
         self._limit_speed = options.limit_speed  # Limit the robot's walking speed.
         self._avoid_obstacles = options.avoid_obstacles  # Disable obstacle avoidance.
+
+        # Fiducial ID to follow.
+        self._visible_ids = []
+        self._selected_tag_id = None
+        self._follow_selected_only = False
+        self._master_tag_id = 5
 
         # Epsilon distance between robot and desired go-to point.
         self._x_eps = .05
@@ -141,7 +141,6 @@ class FollowFiducial(object):
             self._stop.clear()
         self._movement_on = True
         self._attempts = 0
-        
         # Stand the robot up.
         if self._standup:
             self.power_on()
@@ -155,12 +154,13 @@ class FollowFiducial(object):
 
             if fiducials:
                 # Log all visible IDs
-                visible_ids = [f.apriltag_properties.tag_id for f in fiducials]
-                LOGGER.info("Visible fiducials: %s", visible_ids)
+                self._visible_ids = [f.apriltag_properties.tag_id for f in fiducials]
+                LOGGER.info("Visible fiducials: %s", self._visible_ids)
 
-                # Pick tag 5 if it's in view
-                target = next((f for f in fiducials if f.apriltag_properties.tag_id == 5), None)
+                # Pick master tag if it's in view
+                target = next((f for f in fiducials if f.apriltag_properties.tag_id == self._master_tag_id), None)
                 if target is not None:
+                    winsound.PlaySound("SPOT following.wav", winsound.SND_FILENAME)
                     tf = get_a_tform_b(
                         target.transforms_snapshot,
                         VISION_FRAME_NAME,
@@ -168,15 +168,43 @@ class FollowFiducial(object):
                         )
                     if tf is not None:
                         pos = tf.to_proto().position
-                        LOGGER.info("Following fiducial 5")
-                        self.go_to_tag(pos)
+                        LOGGER.info("Following master fiducial %d", self._master_tag_id)
+                        self.go_to_tag(pos, locomotion_hint=spot_command_pb2.HINT_AUTO)
                     else:
-                        LOGGER.info("Tag 5 detected but transform not available yet")
+                        LOGGER.info("Master tag detected but transform not available yet")
+
+                elif self._follow_selected_only and self._selected_tag_id in self._visible_ids:
+                    sel = self._selected_tag_id
+                    target = next((f for f in fiducials
+                                   if f.apriltag_properties.tag_id == sel), None)
+                    if target is not None:
+                        tf = get_a_tform_b(
+                            target.transforms_snapshot,
+                            VISION_FRAME_NAME,
+                            target.apriltag_properties.frame_name_fiducial,
+                        )
+                        if tf is not None:
+                            pos = tf.to_proto().position
+                            if sel == 10:
+                                LOGGER.info("Jogging to selected fiducial 10")
+                                self.go_to_tag(pos, locomotion_hint=spot_command_pb2.HINT_JOG)
+                            else:
+                                LOGGER.info("Following selected fiducial %d", sel)
+                                self.go_to_tag(pos, locomotion_hint=spot_command_pb2.HINT_AUTO)
+                        else:
+                            LOGGER.info("Selected tag %d transform not available yet", sel)
+                    else:
+                        LOGGER.info("Selected tag %d not in current fiducials", sel)
+
+                else:
+                    LOGGER.info("No target selected/visible (master not in view).")
+
             else:
+                self._visible_ids = []
                 LOGGER.info("No fiducials found")
 
-        self._attempts += 1
-        time.sleep(0.01)  # keep your original pacing
+            self._attempts += 1
+            time.sleep(0.01)  # keep your original pacing
 
     def stop(self):
         self._movement_on = False
@@ -210,7 +238,7 @@ class FollowFiducial(object):
         self._powered_on = True
         print(f'Powered On {self._robot.is_powered_on()}')
 
-    def go_to_tag(self, fiducial_rt_world):
+    def go_to_tag(self, fiducial_rt_world, locomotion_hint):
         """Use the position of the april tag in vision world frame and command the robot."""
         # Compute the go-to point (offset by .15m from the fiducial position) and the heading at
         # this point.
@@ -219,10 +247,23 @@ class FollowFiducial(object):
 
         #Command the robot to go to the tag in kinematic odometry frame
         mobility_params = self.set_mobility_params()
-        tag_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
-            goal_x=self._current_tag_world_pose[0], goal_y=self._current_tag_world_pose[1],
-            goal_heading=self._angle_desired, frame_name=VISION_FRAME_NAME, params=mobility_params,
-            body_height=0.0, locomotion_hint=spot_command_pb2.HINT_AUTO)
+
+        if mobility_params is not None and locomotion_hint is not None:
+            mobility_params.locomotion_hint = locomotion_hint
+            tag_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
+                goal_x=self._current_tag_world_pose[0], goal_y=self._current_tag_world_pose[1],
+                goal_heading=self._angle_desired, frame_name=VISION_FRAME_NAME, params=mobility_params,
+                body_height=0.0)
+        else:
+            tag_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
+            goal_x=self._current_tag_world_pose[0],
+            goal_y=self._current_tag_world_pose[1],
+            goal_heading=self._angle_desired,
+            frame_name=VISION_FRAME_NAME,
+            params=None,
+            body_height=0.0,
+            locomotion_hint=locomotion_hint)
+            
         end_time = 5.0
         if self._movement_on and self._powered_on:
             #Issue the command to the robot
@@ -293,20 +334,66 @@ class FollowFiducial(object):
                 linear=Vec2(x=self._max_x_vel, y=self._max_y_vel), angular=self._max_ang_vel))
             if not self._avoid_obstacles:
                 mobility_params = spot_command_pb2.MobilityParams(
-                    obstacle_params=obstacles, vel_limit=speed_limit, body_control=body_control,
-                    locomotion_hint=spot_command_pb2.HINT_AUTO)
+                    obstacle_params=obstacles, vel_limit=speed_limit, body_control=body_control)
             else:
                 mobility_params = spot_command_pb2.MobilityParams(
-                    vel_limit=speed_limit, body_control=body_control,
-                    locomotion_hint=spot_command_pb2.HINT_AUTO)
+                    vel_limit=speed_limit, body_control=body_control)
         elif not self._avoid_obstacles:
             mobility_params = spot_command_pb2.MobilityParams(
-                obstacle_params=obstacles, body_control=body_control,
-                locomotion_hint=spot_command_pb2.HINT_AUTO)
+                obstacle_params=obstacles, body_control=body_control)
         else:
             #When set to none, RobotCommandBuilder populates with good default values
             mobility_params = None
         return mobility_params
+    
+    def get_visible_tag_ids(self):
+        """Return the list of currently visible fiducial IDs (ints)."""
+        return list(self._visible_ids)
+
+    @property
+    def selected_tag_id(self):
+        return self._selected_tag_id
+
+    @property
+    def follow_selected_only(self):
+        return self._follow_selected_only
+
+    def set_selected_tag(self, tag_id):
+        """Directly set the selected tag (int or None)."""
+        try:
+            self._selected_tag_id = int(tag_id) if tag_id is not None else None
+        except Exception:
+            pass
+
+    def cycle_selected(self, direction=+1):
+        """Move selection to next/previous visible tag."""
+        if not self._visible_ids:
+            return
+        # If current selection not visible, snap to the first visible
+        if self._selected_tag_id not in self._visible_ids:
+            self._selected_tag_id = self._visible_ids[0]
+            return
+        i = self._visible_ids.index(self._selected_tag_id)
+        i = (i + direction) % len(self._visible_ids)
+        self._selected_tag_id = self._visible_ids[i]
+
+    def toggle_follow_selected(self):
+        """Toggle follow-selected mode. Returns new boolean state."""
+        self._follow_selected_only = not self._follow_selected_only
+        # when user toggles back on, also resume motion
+        if self._follow_selected_only:
+            self._movement_on = True
+        return self._follow_selected_only
+
+    def cancel_motion_now(self):
+        """Immediately stop whatever motion Spot is executing and pause following."""
+        self._movement_on = False
+        try:
+            self._robot_command_client.robot_command(
+                command=RobotCommandBuilder.stop_command()
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def set_default_body_control():
