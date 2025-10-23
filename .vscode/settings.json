@@ -2,6 +2,6 @@
     "python.analysis.extraPaths": [
         "./python/bosdyn-client/src"
     ],
-    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
     "python-envs.pythonProjects": []
 }
